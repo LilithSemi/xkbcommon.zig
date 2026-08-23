@@ -8,10 +8,13 @@
             .url = "git+https://github.com/ianprime0509/zig-xml.git#6a446191d2509788959766b60a13b8626d9ad078",
             .hash = "xml-0.2.0-ZTbP3x07AgAwDNgFEj9liF24YjojTKyznD3-Njf9w5HT",
         },
-        .xcb = .{ .path = "subprojects/xcb" },
         .xorgproto = .{
-            .url = "https://xorg.freedesktop.org/archive/individual/proto/xorgproto-2024.1.tar.xz",
-            .hash = "N-V-__8AAJBbcQCJP91b8-T7BYBEwQNarvUXkrSsLo7z-9rl",
+            .url = "https://gitlab.freedesktop.org/xorg/proto/xorgproto/-/archive/xorgproto-2024.1/xorgproto-xorgproto-2024.1.tar.gz",
+            .hash = "N-V-__8AAJkAZgCO0RI9CmCz9GB-r604Mcghuo2rp7BoteNP",
+        },
+        .x11 = .{
+            .url = "git+https://github.com/Midstall/x11.zig#3c019b8499dd6ac7603cc21e2e8cb1dfc996fd8c",
+            .hash = "x11-0.1.0-dfzXO7wAEgC-57MgUExNfIJar2UynqB5b8iZfKaKAm2J",
         },
     },
     .paths = .{ "build.zig.zon", "build.zig", "src", "generator", "data" },

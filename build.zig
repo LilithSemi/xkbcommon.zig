@@ -1,4 +1,5 @@
 const std = @import("std");
+const x11_build = @import("x11");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -14,17 +15,41 @@ pub fn build(b: *std.Build) void {
     const xml_dep = b.dependency("xml", .{ .target = target, .optimize = optimize });
     xkb_mod.addImport("xml", xml_dep.module("xml"));
 
-    // Pure-Zig XCB implementation for the x11 module. Zero C deps.
-    const xcb_dep = b.dependency("xcb", .{ .target = target, .optimize = optimize });
-    xkb_mod.addImport("xcb", xcb_dep.module("xcb"));
+    // Pure-Zig X11 client for src/x11.zig. Zero C deps.
+    const x11_dep = b.dependency("x11", .{ .target = target, .optimize = optimize });
+    xkb_mod.addImport("x11", x11_dep.module("x11"));
+
+    // XKB wire bindings are generated from the official xcbproto XML rather than
+    // hand-written, so the struct layouts track the protocol definition instead
+    // of a transcription of it. The XML ships inside x11.zig's own xcbproto
+    // dependency, so reach it through that builder.
+    //
+    // generateProtocol wires `x11` into each generated module, but not `xproto`:
+    // xkb.xml refers to xproto types (ATOM, KEYCODE, KEYSYM), so xkb.xml is
+    // passed as an import seed AND the resulting module gets `xproto` added here.
+    const xcbproto = x11_dep.builder.dependency("xcbproto", .{});
+    const xproto_xml = xcbproto.path("src/xproto.xml");
+
+    const xproto_mod = x11_build.generateProtocol(b, x11_dep, xproto_xml, &.{}, "xproto");
+    const xkbproto_mod = x11_build.generateProtocol(b, x11_dep, xcbproto.path("src/xkb.xml"), &.{xproto_xml}, "xkb");
+    xkbproto_mod.addImport("xproto", xproto_mod);
+
+    xkb_mod.addImport("xproto", xproto_mod);
+    xkb_mod.addImport("xkbproto", xkbproto_mod);
 
     // Generate the keysym tables at build time from xorgproto's keysymdef.h and
     // XF86keysym.h (parsed as text, no C compiled), so nothing generated is committed.
     const xorgproto = b.dependency("xorgproto", .{});
 
+    // The keysym-gen generator runs at build time on the HOST, so it must be
+    // host-native. Building it for `target` breaks cross-compilation (e.g.
+    // `-Dcpu=apple_m1`): the generator becomes a target binary that cannot
+    // execute on the host (Illegal instruction). The `tables_mod` it emits is
+    // plain generated Zig with no target of its own, so it inherits the
+    // importing module's target and stays correct.
     const gen_root = b.createModule(.{
         .root_source_file = b.path("generator/keysyms.zig"),
-        .target = target,
+        .target = b.graph.host,
         .optimize = optimize,
     });
     const gen_exe = b.addExecutable(.{ .name = "keysym-gen", .root_module = gen_root });

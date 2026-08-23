@@ -1,7 +1,16 @@
+//! Keymap retrieval from a live X server over the XKEYBOARD extension.
+//!
+//! Wire structures come from x11.zig's generated xcbproto bindings (`xproto`
+//! and `xkbproto`): those decode the packets. What lives here is the reading of
+//! XKB's irregular, presence-driven reply payloads into an xkbcommon Keymap,
+//! plus the bounds validation those payloads need before anything walks them.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const native_endian = builtin.cpu.arch.endian();
-const xcb = @import("xcb");
+const x11 = @import("x11");
+const xproto = @import("xproto");
+const xkbproto = @import("xkbproto");
 const Context = @import("context.zig").Context;
 const Atom = @import("context.zig").Atom;
 const Keysym = @import("keysym.zig").Keysym;
@@ -13,6 +22,7 @@ const Key = keymap_mod.Key;
 const Group = keymap_mod.Group;
 const Level = keymap_mod.Level;
 const Led = keymap_mod.Led;
+const ModsFlags = keymap_mod.ModsFlags;
 const SymInterpret = keymap_mod.SymInterpret;
 const MatchOp = keymap_mod.MatchOp;
 const Action = keymap_mod.Action;
@@ -20,8 +30,367 @@ const Action = keymap_mod.Action;
 /// XkbUseCoreKbd: the core keyboard device spec.
 pub const CORE_KEYBOARD: u16 = 0x0100;
 
-/// Map XKB wire match-op nibble to MatchOp enum.
-fn wireMatchOp(raw: u4) MatchOp {
+/// Faults raised by reading an X reply. Every one of them means the server (or
+/// something impersonating it) sent bytes that do not describe a usable reply.
+pub const DecodeError = error{
+    /// The buffer ends before a section the reply header says is present.
+    ShortReply,
+    /// A length or offset in the reply cannot be represented, or the header
+    /// contradicts itself (max_key_code below min_key_code, for instance).
+    MalformedReply,
+};
+
+pub const ParseError = DecodeError || std.mem.Allocator.Error;
+
+/// Every XkbGetMap reply starts with 40 fixed bytes; sections follow.
+const map_header_len: usize = 40;
+/// KeyType: 8 header bytes, then nMapEntries KTMapEntry, then the preserve list.
+const key_type_header_len: usize = 8;
+const kt_map_entry_len: usize = 8;
+const mod_def_len: usize = 4;
+/// KeySymMap: 8 header bytes, then nSyms 32-bit keysyms.
+const key_sym_map_len: usize = 8;
+const keysym_len: usize = 4;
+/// XkbAction and its per-key record widths.
+const action_len: usize = 8;
+const set_behavior_len: usize = 4;
+const set_explicit_len: usize = 2;
+const key_mod_map_len: usize = 2;
+const key_vmod_map_len: usize = 4;
+/// Both XkbGetNames and XkbGetCompatMap put their variable data after 32 bytes.
+const reply_header_len: usize = 32;
+/// XkbGetControls carries numGroups at byte 9.
+const controls_num_groups_offset: usize = 9;
+
+/// Ask XkbGetNames for every name section the protocol defines (bits 0 to 13).
+const names_which_all: u32 = (@as(u32, @intFromEnum(xkbproto.NameDetail.RGNames)) << 1) - 1;
+/// Ask XkbGetMap for every map component (bits 0 to 7).
+const map_full_all: u16 = (@as(u16, @intFromEnum(xkbproto.MapPart.VirtualModMap)) << 1) - 1;
+
+// The bindings declare the SymInterpret match bits as enum(u32), but the wire
+// field is one byte, so narrow them once here instead of at every use.
+const si_op_mask: u8 = @intFromEnum(xkbproto.SymInterpMatch.OpMask);
+const si_level_one_only: u8 = @intFromEnum(xkbproto.SymInterpMatch.LevelOneOnly);
+/// XkbSI_AutoRepeat, from X11/extensions/XKB.h.
+const si_auto_repeat: u8 = 1 << 0;
+
+fn addChecked(a: usize, b: usize) DecodeError!usize {
+    return std.math.add(usize, a, b) catch error.MalformedReply;
+}
+
+fn mulChecked(a: usize, b: usize) DecodeError!usize {
+    return std.math.mul(usize, a, b) catch error.MalformedReply;
+}
+
+/// Round a section offset up to the 4-byte boundary XKB pads every section to.
+fn align4(n: usize) DecodeError!usize {
+    return (try addChecked(n, 3)) & ~@as(usize, 3);
+}
+
+// ---------------------------------------------------------------------------
+// XkbGetMap
+// ---------------------------------------------------------------------------
+
+/// Walk every section an XkbGetMap reply header claims, in wire order, and
+/// confirm the buffer actually holds them.
+///
+/// This has to run before `decodeGetMapReply`. The KeyType and KeySymMap
+/// sections are variable-length, so the generated decoder walks them with a
+/// cursor it does not re-check against the buffer: a header claiming more
+/// records than the buffer holds makes it slice past the end. A reply is bytes
+/// off a socket, so that has to be a returned error rather than a panic.
+///
+/// The traversal below mirrors the generated decoder step for step, including
+/// its section order and its padding, so passing here means the decode is safe.
+fn validateGetMap(bytes: []const u8) DecodeError!void {
+    if (bytes.len < map_header_len) return error.ShortReply;
+
+    const present = std.mem.readInt(u16, bytes[12..14], native_endian);
+    const n_types: usize = bytes[15];
+    const total_actions: usize = std.mem.readInt(u16, bytes[22..24], native_endian);
+    const n_key_actions: usize = bytes[24];
+    const n_key_syms: usize = bytes[20];
+    const total_key_behaviors: usize = bytes[27];
+    const total_key_explicit: usize = bytes[30];
+    const total_mod_map_keys: usize = bytes[33];
+    const total_vmod_map_keys: usize = bytes[36];
+    const virtual_mods = std.mem.readInt(u16, bytes[38..40], native_endian);
+
+    var off: usize = map_header_len;
+
+    if (present & @intFromEnum(xkbproto.MapPart.KeyTypes) != 0) {
+        for (0..n_types) |_| {
+            if (try addChecked(off, key_type_header_len) > bytes.len) return error.ShortReply;
+            const n_entries: usize = bytes[off + 5];
+            const has_preserve = bytes[off + 6] != 0;
+            off = try addChecked(off, key_type_header_len);
+            off = try addChecked(off, try mulChecked(n_entries, kt_map_entry_len));
+            if (has_preserve) off = try addChecked(off, try mulChecked(n_entries, mod_def_len));
+            if (off > bytes.len) return error.ShortReply;
+        }
+    }
+
+    if (present & @intFromEnum(xkbproto.MapPart.KeySyms) != 0) {
+        for (0..n_key_syms) |_| {
+            if (try addChecked(off, key_sym_map_len) > bytes.len) return error.ShortReply;
+            const n_syms: usize = std.mem.readInt(u16, bytes[off + 6 ..][0..2], native_endian);
+            off = try addChecked(off, key_sym_map_len);
+            off = try addChecked(off, try mulChecked(n_syms, keysym_len));
+            if (off > bytes.len) return error.ShortReply;
+        }
+    }
+
+    // Key actions are a count byte per key, padded to 4, then the action bodies.
+    if (present & @intFromEnum(xkbproto.MapPart.KeyActions) != 0) {
+        off = try align4(try addChecked(off, n_key_actions));
+        off = try addChecked(off, try mulChecked(total_actions, action_len));
+        if (off > bytes.len) return error.ShortReply;
+    }
+
+    if (present & @intFromEnum(xkbproto.MapPart.KeyBehaviors) != 0) {
+        off = try addChecked(off, try mulChecked(total_key_behaviors, set_behavior_len));
+        if (off > bytes.len) return error.ShortReply;
+    }
+
+    // One byte per virtual modifier that the virtualMods mask names.
+    if (present & @intFromEnum(xkbproto.MapPart.VirtualMods) != 0) {
+        off = try align4(try addChecked(off, @popCount(virtual_mods)));
+        if (off > bytes.len) return error.ShortReply;
+    }
+
+    if (present & @intFromEnum(xkbproto.MapPart.ExplicitComponents) != 0) {
+        off = try align4(try addChecked(off, try mulChecked(total_key_explicit, set_explicit_len)));
+        if (off > bytes.len) return error.ShortReply;
+    }
+
+    if (present & @intFromEnum(xkbproto.MapPart.ModifierMap) != 0) {
+        off = try align4(try addChecked(off, try mulChecked(total_mod_map_keys, key_mod_map_len)));
+        if (off > bytes.len) return error.ShortReply;
+    }
+
+    if (present & @intFromEnum(xkbproto.MapPart.VirtualModMap) != 0) {
+        off = try addChecked(off, try mulChecked(total_vmod_map_keys, key_vmod_map_len));
+        if (off > bytes.len) return error.ShortReply;
+    }
+}
+
+/// A validated XkbGetMap reply with its variable-length sections flattened into
+/// indexable slices.
+///
+/// The generated decoder hands back forward-only iterators over the KeyType and
+/// KeySymMap sections, but building a keymap needs random access by keycode, so
+/// they are walked once into arena-owned slices here instead of being re-walked
+/// per lookup.
+///
+/// The slices borrow the reply buffer passed to `parseGetMap`. That buffer must
+/// outlive the view.
+pub const MapView = struct {
+    arena: std.heap.ArenaAllocator,
+    reply: xkbproto.GetMapReply,
+    types: []const xkbproto.KeyType,
+    /// KeySymMap records, indexed by (keycode - reply.firstKeySym).
+    syms: []const xkbproto.KeySymMap,
+    modmap: []const xkbproto.KeyModMap,
+
+    pub fn deinit(self: *MapView) void {
+        self.arena.deinit();
+    }
+
+    /// The keysym for (keycode, group, level), or null when any of them is out
+    /// of range for this map.
+    pub fn symForKey(self: *const MapView, keycode: u8, group: u8, level: u8) ?u32 {
+        if (keycode < self.reply.firstKeySym) return null;
+        const idx: usize = @as(usize, keycode) - @as(usize, self.reply.firstKeySym);
+        if (idx >= self.syms.len) return null;
+
+        const m = self.syms[idx];
+        if (group >= groupCount(m)) return null;
+        if (level >= m.width) return null;
+
+        const row = std.math.mul(usize, group, m.width) catch return null;
+        const offset = std.math.add(usize, row, level) catch return null;
+        if (offset >= m.syms.len) return null;
+        return m.syms[offset];
+    }
+};
+
+/// Number of groups a KeySymMap defines (the low nibble of groupInfo).
+pub fn groupCount(m: xkbproto.KeySymMap) u8 {
+    return m.groupInfo & 0x0f;
+}
+
+/// Validate and decode an XkbGetMap reply.
+///
+/// `bytes` is borrowed by the returned view and must outlive it. Call `deinit`
+/// on the view to release the flattened section slices.
+pub fn parseGetMap(gpa: std.mem.Allocator, bytes: []const u8) ParseError!MapView {
+    try validateGetMap(bytes);
+
+    const reply = xkbproto.decodeGetMapReply(bytes);
+
+    // A map whose last keycode precedes its first describes no keys at all and
+    // would make the keycode loop in keymapFromGetMap run backwards. The old
+    // parser passed such a header straight through.
+    if (reply.maxKeyCode < reply.minKeyCode) return error.MalformedReply;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var types: []xkbproto.KeyType = &.{};
+    if (reply.values.types_rtrn) |iter_const| {
+        var iter = iter_const;
+        types = try a.alloc(xkbproto.KeyType, iter.len());
+        var i: usize = 0;
+        while (iter.next()) |kt| : (i += 1) types[i] = kt;
+    }
+
+    var syms: []xkbproto.KeySymMap = &.{};
+    if (reply.values.syms_rtrn) |iter_const| {
+        var iter = iter_const;
+        syms = try a.alloc(xkbproto.KeySymMap, iter.len());
+        var i: usize = 0;
+        while (iter.next()) |ksm| : (i += 1) syms[i] = ksm;
+    }
+
+    var modmap: []xkbproto.KeyModMap = &.{};
+    if (reply.values.modmap_rtrn) |list| {
+        modmap = try a.alloc(xkbproto.KeyModMap, list.len());
+        for (modmap, 0..) |*e, i| e.* = list.at(i);
+    }
+
+    return .{
+        .arena = arena,
+        .reply = reply,
+        .types = types,
+        .syms = syms,
+        .modmap = modmap,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// XkbGetNames
+// ---------------------------------------------------------------------------
+
+/// A decoded XkbGetNames reply. Every slice it hands out borrows the reply
+/// buffer passed to `parseGetNames`, which must outlive the view.
+pub const NamesView = struct {
+    reply: xkbproto.GetNamesReply,
+
+    /// One atom per key type.
+    pub fn typeNames(self: *const NamesView) []align(1) const xproto.ATOM {
+        return self.reply.values.typeNames orelse &.{};
+    }
+
+    /// One atom per named indicator.
+    pub fn indicatorNames(self: *const NamesView) []align(1) const xproto.ATOM {
+        return self.reply.values.indicatorNames orelse &.{};
+    }
+
+    /// One atom per named virtual modifier.
+    pub fn virtualModNames(self: *const NamesView) []align(1) const xproto.ATOM {
+        return self.reply.values.virtualModNames orelse &.{};
+    }
+
+    /// One atom per named group.
+    pub fn groupNames(self: *const NamesView) []align(1) const xproto.ATOM {
+        return self.reply.values.groups orelse &.{};
+    }
+
+    /// The name of a key, or null when the keycode is out of range or unnamed.
+    pub fn keyName(self: *const NamesView, keycode: u8) ?[]const u8 {
+        const names = self.reply.values.keyNames orelse return null;
+        if (keycode < self.reply.firstKey) return null;
+        const idx: usize = @as(usize, keycode) - @as(usize, self.reply.firstKey);
+        if (idx >= names.len()) return null;
+
+        const raw = names.at(idx).name;
+        // KEYNAME is a fixed 4-byte field padded with NULs, so the name ends at
+        // the first NUL. The old parser only trimmed trailing NULs, which let an
+        // embedded NUL through into the interned atom.
+        const end = std.mem.indexOfScalar(u8, raw, 0) orelse raw.len;
+        if (end == 0) return null;
+        return raw[0..end];
+    }
+};
+
+/// Decode an XkbGetNames reply. `bytes` is borrowed by the returned view.
+pub fn parseGetNames(bytes: []const u8) DecodeError!NamesView {
+    if (bytes.len < reply_header_len) return error.ShortReply;
+    // Every list in this reply is bounded against the buffer by the generated
+    // decoder, so a truncated section decodes as empty rather than overrunning.
+    return .{ .reply = xkbproto.decodeGetNamesReply(bytes) };
+}
+
+// ---------------------------------------------------------------------------
+// XkbGetControls and XkbGetCompatMap
+// ---------------------------------------------------------------------------
+
+/// The one XkbGetControls field a keymap needs: how many groups the device has.
+pub const ControlsView = struct {
+    num_groups: u8,
+};
+
+pub fn parseGetControls(bytes: []const u8) DecodeError!ControlsView {
+    if (bytes.len <= controls_num_groups_offset) return error.ShortReply;
+    return .{ .num_groups = xkbproto.decodeGetControlsReply(bytes).numGroups };
+}
+
+/// A decoded XkbGetCompatMap reply. `interprets` borrows the reply buffer.
+pub const CompatView = struct {
+    reply: xkbproto.GetCompatMapReply,
+
+    pub fn interprets(self: *const CompatView) xkbproto.ListView(xkbproto.SymInterpret) {
+        return self.reply.si_rtrn;
+    }
+};
+
+/// Decode an XkbGetCompatMap reply. `bytes` is borrowed by the returned view.
+pub fn parseGetCompatMap(bytes: []const u8) DecodeError!CompatView {
+    if (bytes.len < reply_header_len) return error.ShortReply;
+    return .{ .reply = xkbproto.decodeGetCompatMapReply(bytes) };
+}
+
+// ---------------------------------------------------------------------------
+// XKB extension setup
+// ---------------------------------------------------------------------------
+
+pub const XkbSetup = struct {
+    major_opcode: u8,
+    server_major: u16,
+    server_minor: u16,
+};
+
+/// Negotiate the XKEYBOARD extension. A server refuses every other XKB request
+/// until XkbUseExtension has agreed on a version, so this runs first.
+pub fn setupXkb(client: *x11.Client) !XkbSetup {
+    const info = try client.queryExtension(xkbproto.extension_xname);
+    if (!info.present) return error.XkbNotSupported;
+
+    const c = try xkbproto.use_extension(client, 1, 0);
+    var xe: x11.wire.XError = undefined;
+    var reply = try client.awaitReply(xkbproto.UseExtensionReply, c, &xe);
+    defer reply.deinit();
+
+    const use = xkbproto.decodeUseExtensionReply(reply.bytes);
+    if (!use.supported) return error.XkbVersionUnsupported;
+    return .{
+        .major_opcode = info.major_opcode,
+        .server_major = use.serverMajor,
+        .server_minor = use.serverMinor,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Compat interpretation
+// ---------------------------------------------------------------------------
+
+/// Map an XKB wire match op to a MatchOp.
+///
+/// Ops above Exactly are not defined by the protocol. They resolve to `.none`,
+/// which never matches, so a server sending one loses that single interpret
+/// instead of the whole keymap.
+fn wireMatchOp(raw: u8) MatchOp {
     return switch (raw) {
         0 => .none_of,
         1 => .any_of_or_none,
@@ -32,36 +401,45 @@ fn wireMatchOp(raw: u4) MatchOp {
     };
 }
 
-/// Decode an 8-byte raw XkbAction body into an Action.
-/// Decodes SetMods (1), LatchMods (2), LockMods (3), Terminate (0x0C).
-/// Everything else becomes .private.
-fn decodeXkbAction(raw: [8]u8) Action {
-    return switch (raw[0]) {
-        0 => .none,
-        1 => .{ .mods = .{ .kind = .set, .mods = @as(u32, raw[3]), .mods_by_name = false, .flags = @bitCast(raw[1]) } },
-        2 => .{ .mods = .{ .kind = .latch, .mods = @as(u32, raw[3]), .mods_by_name = false, .flags = @bitCast(raw[1]) } },
-        3 => .{ .mods = .{ .kind = .lock, .mods = @as(u32, raw[3]), .mods_by_name = false, .flags = @bitCast(raw[1]) } },
-        0x0C => .terminate,
-        else => .{ .private = .{ .kind = raw[0], .data = raw[1..8].* } },
-    };
-}
+/// Read an 8-byte XkbAction body into an Action.
+///
+/// SetMods (1), LatchMods (2), LockMods (3) and Terminate (0x0C) are modelled;
+/// everything else is kept verbatim as `.private` so no data is lost.
+fn decodeXkbAction(wire: xkbproto.SIAction) Action {
+    // A complete SymInterpret always carries all 7 data bytes. A short one only
+    // arrives on a malformed reply, and has no action worth reading.
+    if (wire.data.len < 7) return .none;
 
-/// Apply sym_interprets to all key levels that have no explicit action.
-/// Same semantics as compile_link.findMatchingInterpret.
-fn applyCompatPass(km: *Keymap) void {
-    for (km.keys) |*key| {
-        if (key.keycode == 0) continue;
-        for (key.groups) |*group| {
-            for (group.levels, 0..) |*level, l_idx| {
-                if (std.meta.activeTag(level.action) != .none) continue;
-                if (level.syms.len != 1) continue;
-                const sym = level.syms[0];
-                if (findBestInterp(km.sym_interprets, sym, key.modmap, l_idx)) |interp| {
-                    level.action = interp.action;
-                }
-            }
-        }
-    }
+    // Rebuild the wire body so the field offsets come from the generated
+    // SASetMods layout rather than from hand-counted indices.
+    var raw: [action_len]u8 = undefined;
+    raw[0] = wire.type;
+    @memcpy(raw[1..action_len], wire.data[0..7]);
+    const set_mods = xkbproto.SASetMods.decodeElement(&raw, native_endian);
+
+    const mods_action: Action.ModsAction = .{
+        .kind = .set,
+        .mods = @as(u32, set_mods.realMods),
+        .mods_by_name = false,
+        .flags = @as(ModsFlags, @bitCast(set_mods.flags)),
+    };
+
+    return switch (wire.type) {
+        0 => .none,
+        1 => .{ .mods = mods_action },
+        2 => .{ .mods = blk: {
+            var a = mods_action;
+            a.kind = .latch;
+            break :blk a;
+        } },
+        3 => .{ .mods = blk: {
+            var a = mods_action;
+            a.kind = .lock;
+            break :blk a;
+        } },
+        0x0C => .terminate,
+        else => .{ .private = .{ .kind = wire.type, .data = wire.data[0..7].* } },
+    };
 }
 
 fn interpModMatch(match: MatchOp, interp_mods: keymap_mod.ModMask, key_modmap: keymap_mod.ModMask) bool {
@@ -93,143 +471,149 @@ fn findBestInterp(
     return wildcard;
 }
 
-/// Build a Keymap from a live X server using XkbGetMap, XkbGetNames, XkbGetControls,
-/// and XkbGetCompatMap. All requests are pipelined before reading replies.
-/// device_spec is typically CORE_KEYBOARD (0x0100).
-pub fn keymapNewFromDevice(ctx: *Context, conn: *xcb.conn.Connection, device_spec: u16) !*Keymap {
-    const xkb_setup = try xcb.xkb.setupXkb(conn);
+/// Apply sym_interprets to every key level that carries no explicit action.
+/// Same semantics as compile_link's compat pass.
+fn applyCompatPass(km: *Keymap) void {
+    for (km.keys) |*key| {
+        if (key.keycode == 0) continue;
+        for (key.groups) |*group| {
+            for (group.levels, 0..) |*level, l_idx| {
+                if (std.meta.activeTag(level.action) != .none) continue;
+                if (level.syms.len != 1) continue;
+                const sym = level.syms[0];
+                if (findBestInterp(km.sym_interprets, sym, key.modmap, l_idx)) |interp| {
+                    level.action = interp.action;
+                    // The X11 path has no explicit per-key repeat setting to
+                    // defer to, so a repeating interpret always wins. The old
+                    // code left every key non-repeating.
+                    if (interp.repeat) key.repeats = true;
+                }
+            }
+        }
+    }
+}
 
-    const min_kc = conn.setup.min_keycode;
-    const max_kc = conn.setup.max_keycode;
+// ---------------------------------------------------------------------------
+// Keymap construction
+// ---------------------------------------------------------------------------
+
+/// Build a Keymap from a live X server using XkbGetMap, XkbGetNames,
+/// XkbGetControls and XkbGetCompatMap. All requests go out before any reply is
+/// read; the connection buffers replies by sequence, so the order they arrive
+/// in does not matter. `device_spec` is normally `CORE_KEYBOARD`.
+pub fn keymapNewFromDevice(ctx: *Context, client: *x11.Client, device_spec: u16) !*Keymap {
+    _ = try setupXkb(client);
+
+    const min_kc = client.conn.setup.min_keycode;
+    const max_kc = client.conn.setup.max_keycode;
     const n_kc: u8 = max_kc -% min_kc +% 1;
 
-    var map_extra: [24]u8 = std.mem.zeroes([24]u8);
-    std.mem.writeInt(u16, map_extra[0..2], device_spec, native_endian);
-    std.mem.writeInt(u16, map_extra[2..4], 0x00ff, native_endian);
-    std.mem.writeInt(u16, map_extra[4..6], 0x0000, native_endian);
-    map_extra[6] = 0;
-    map_extra[7] = 0;
-    map_extra[8] = min_kc;
-    map_extra[9] = n_kc;
-    map_extra[10] = min_kc;
-    map_extra[11] = n_kc;
-    map_extra[12] = min_kc;
-    map_extra[13] = n_kc;
-    std.mem.writeInt(u16, map_extra[14..16], 0xffff, native_endian);
-    map_extra[16] = min_kc;
-    map_extra[17] = n_kc;
-    map_extra[18] = min_kc;
-    map_extra[19] = n_kc;
-    map_extra[20] = min_kc;
-    map_extra[21] = n_kc;
-    const seq_map = try conn.sendRequest(xkb_setup.major_opcode, 8, &map_extra);
+    // `full` already names every component, so the partial ranges only bound
+    // the per-keycode sections. firstType/nTypes stay zero for the same reason.
+    const map_cookie = try xkbproto.get_map(
+        client,
+        device_spec,
+        map_full_all,
+        0,
+        0,
+        0,
+        min_kc,
+        n_kc,
+        min_kc,
+        n_kc,
+        min_kc,
+        n_kc,
+        0xffff,
+        min_kc,
+        n_kc,
+        min_kc,
+        n_kc,
+        min_kc,
+        n_kc,
+    );
+    const names_cookie = try xkbproto.get_names(client, device_spec, names_which_all);
+    const ctrl_cookie = try xkbproto.get_controls(client, device_spec);
+    const compat_cookie = try xkbproto.get_compat_map(client, device_spec, 0xff, true, 0, 0);
 
-    var names_extra: [8]u8 = std.mem.zeroes([8]u8);
-    std.mem.writeInt(u16, names_extra[0..2], device_spec, native_endian);
-    std.mem.writeInt(u32, names_extra[4..8], 0x3FFF, native_endian);
-    const seq_names = try conn.sendRequest(xkb_setup.major_opcode, 17, &names_extra);
+    var xe: x11.wire.XError = undefined;
 
-    var ctrl_extra: [4]u8 = std.mem.zeroes([4]u8);
-    std.mem.writeInt(u16, ctrl_extra[0..2], device_spec, native_endian);
-    const seq_ctrl = try conn.sendRequest(xkb_setup.major_opcode, 6, &ctrl_extra);
-
-    var compat_extra: [8]u8 = std.mem.zeroes([8]u8);
-    std.mem.writeInt(u16, compat_extra[0..2], device_spec, native_endian);
-    compat_extra[2] = 0xFF; // groups: all
-    compat_extra[3] = 1; // getAllSI: true
-    const seq_compat = try conn.sendRequest(xkb_setup.major_opcode, 10, &compat_extra);
-
-    // Read all four replies using a single shared stream reader.
-    var xe: xcb.proto.XError = undefined;
-    var read_buf: [4096]u8 = undefined;
-    var sr = conn.stream.reader(conn.io, &read_buf);
-
-    var reply_map = try xcb.conn.readReplyFrom(&sr.interface, ctx.allocator, seq_map, &xe);
-    defer reply_map.deinit();
-    var map = try xcb.xkb_map.parseGetMap(ctx.allocator, reply_map.bytes);
+    var map_reply = try client.awaitReply(xkbproto.GetMapReply, map_cookie, &xe);
+    defer map_reply.deinit();
+    var map = try parseGetMap(ctx.allocator, map_reply.bytes);
     defer map.deinit();
 
-    var reply_names = try xcb.conn.readReplyFrom(&sr.interface, ctx.allocator, seq_names, &xe);
-    defer reply_names.deinit();
-    var names_reply = try xcb.xkb_names.parseGetNames(ctx.allocator, reply_names.bytes);
+    var names_reply = try client.awaitReply(xkbproto.GetNamesReply, names_cookie, &xe);
     defer names_reply.deinit();
+    const names = try parseGetNames(names_reply.bytes);
 
-    var reply_ctrl = try xcb.conn.readReplyFrom(&sr.interface, ctx.allocator, seq_ctrl, &xe);
-    defer reply_ctrl.deinit();
-    const controls = try xcb.xkb_controls.parseGetControls(reply_ctrl.bytes);
+    var ctrl_reply = try client.awaitReply(xkbproto.GetControlsReply, ctrl_cookie, &xe);
+    defer ctrl_reply.deinit();
+    const controls = try parseGetControls(ctrl_reply.bytes);
 
-    var reply_compat = try xcb.conn.readReplyFrom(&sr.interface, ctx.allocator, seq_compat, &xe);
-    defer reply_compat.deinit();
-    var compat_reply = try xcb.xkb_compat.parseGetCompatMap(ctx.allocator, reply_compat.bytes);
+    var compat_reply = try client.awaitReply(xkbproto.GetCompatMapReply, compat_cookie, &xe);
     defer compat_reply.deinit();
+    const compat = try parseGetCompatMap(compat_reply.bytes);
 
-    // Collect unique non-zero atom IDs across all name arrays.
-    var uniq = std.AutoHashMap(u32, void).init(ctx.allocator);
-    defer uniq.deinit();
+    // Names arrive as atom ids, so every distinct non-zero id needs one
+    // GetAtomName round trip. Collect first, ask once per id.
+    var uniq: std.AutoHashMapUnmanaged(xproto.ATOM, void) = .empty;
+    defer uniq.deinit(ctx.allocator);
 
-    for (names_reply.type_names) |a| if (a != 0) try uniq.put(a, {});
-    for (names_reply.indicator_names) |a| if (a != 0) try uniq.put(a, {});
-    for (names_reply.virtual_mod_names) |a| if (a != 0) try uniq.put(a, {});
-    for (names_reply.group_names) |a| if (a != 0) try uniq.put(a, {});
+    for ([_][]align(1) const xproto.ATOM{
+        names.typeNames(),
+        names.indicatorNames(),
+        names.virtualModNames(),
+        names.groupNames(),
+    }) |list| {
+        for (list) |atom| {
+            if (atom != 0) try uniq.put(ctx.allocator, atom, {});
+        }
+    }
 
-    // Pipeline GetAtomName requests (core opcode 17, extra = atom:u32).
-    const AtomSeq = struct { atom: u32, seq: u16 };
-    var atom_seqs: std.ArrayList(AtomSeq) = .empty;
-    defer atom_seqs.deinit(ctx.allocator);
+    const AtomCookie = struct { atom: xproto.ATOM, cookie: x11.cookie.Cookie(xproto.GetAtomNameReply) };
+    var atom_cookies: std.ArrayList(AtomCookie) = .empty;
+    defer atom_cookies.deinit(ctx.allocator);
+    try atom_cookies.ensureTotalCapacity(ctx.allocator, uniq.count());
 
     var kit = uniq.keyIterator();
-    while (kit.next()) |atom_ptr| {
-        var atom_extra: [4]u8 = undefined;
-        std.mem.writeInt(u32, &atom_extra, atom_ptr.*, native_endian);
-        const seq = try conn.sendRequest(17, 0, &atom_extra);
-        try atom_seqs.append(ctx.allocator, .{ .atom = atom_ptr.*, .seq = seq });
+    while (kit.next()) |atom| {
+        atom_cookies.appendAssumeCapacity(.{
+            .atom = atom.*,
+            .cookie = try xproto.get_atom_name(client, atom.*),
+        });
     }
 
-    // Read all GetAtomName replies (same shared sr reader).
-    // Reply layout: [8..10] nameLength u16, [32..] name bytes.
-    var resolved = std.AutoHashMap(u32, []u8).init(ctx.allocator);
-    defer {
-        var vit = resolved.valueIterator();
-        while (vit.next()) |v| ctx.allocator.free(v.*);
-        resolved.deinit();
-    }
+    var resolved: std.AutoHashMapUnmanaged(xproto.ATOM, Atom) = .empty;
+    defer resolved.deinit(ctx.allocator);
+    try resolved.ensureTotalCapacity(ctx.allocator, uniq.count());
 
-    for (atom_seqs.items) |as| {
-        var atom_reply = try xcb.conn.readReplyFrom(&sr.interface, ctx.allocator, as.seq, &xe);
+    for (atom_cookies.items) |ac| {
+        var atom_reply = try client.awaitReply(xproto.GetAtomNameReply, ac.cookie, &xe);
         defer atom_reply.deinit();
-        if (atom_reply.bytes.len < 32) continue;
-        const name_len = std.mem.readInt(u16, atom_reply.bytes[8..10], native_endian);
-        const end: usize = 32 + @as(usize, name_len);
-        if (atom_reply.bytes.len < end or name_len == 0) continue;
-        const name = try ctx.allocator.dupe(u8, atom_reply.bytes[32..end]);
-        errdefer ctx.allocator.free(name);
-        try resolved.put(as.atom, name);
+        const name = xproto.decodeGetAtomNameReply(atom_reply.bytes).name;
+        // An empty name is what the decoder yields for a truncated reply, and
+        // interning it would name a type or led after nothing.
+        if (name.len == 0) continue;
+        resolved.putAssumeCapacity(ac.atom, try ctx.intern(name));
     }
 
-    const km = try keymapFromGetMap(ctx, &map, controls.num_groups, &names_reply);
+    const km = try keymapFromGetMap(ctx, &map, controls.num_groups, &names);
     errdefer km.destroy();
 
     const arena = km.arena.allocator();
 
+    const type_names = names.typeNames();
     for (km.types, 0..) |*kt, i| {
-        if (i >= names_reply.type_names.len) break;
-        const atom_id = names_reply.type_names[i];
-        if (atom_id != 0) {
-            if (resolved.get(atom_id)) |name| {
-                kt.name = try ctx.intern(name);
-            }
-        }
+        if (i >= type_names.len) break;
+        if (resolved.get(type_names[i])) |name| kt.name = name;
     }
 
-    if (names_reply.indicator_names.len > 0) {
-        const leds = try arena.alloc(Led, names_reply.indicator_names.len);
-        for (leds, names_reply.indicator_names) |*led, atom_id| {
-            const led_name: Atom = if (atom_id != 0) blk: {
-                if (resolved.get(atom_id)) |name| break :blk try ctx.intern(name);
-                break :blk .none;
-            } else .none;
+    const indicator_names = names.indicatorNames();
+    if (indicator_names.len > 0) {
+        const leds = try arena.alloc(Led, indicator_names.len);
+        for (leds, indicator_names) |*led, atom_id| {
             led.* = .{
-                .name = led_name,
+                .name = resolved.get(atom_id) orelse .none,
                 .mods = 0,
                 .groups = 0,
                 .ctrls = 0,
@@ -240,28 +624,32 @@ pub fn keymapNewFromDevice(ctx: *Context, conn: *xcb.conn.Connection, device_spe
         km.leds = leds;
     }
 
-    if (names_reply.group_names.len > 0) {
-        const gnames = try arena.alloc(Atom, names_reply.group_names.len);
-        for (gnames, names_reply.group_names) |*gn, atom_id| {
-            gn.* = if (atom_id != 0) blk: {
-                if (resolved.get(atom_id)) |name| break :blk try ctx.intern(name);
-                break :blk .none;
-            } else .none;
+    const group_atoms = names.groupNames();
+    if (group_atoms.len > 0) {
+        const gnames = try arena.alloc(Atom, group_atoms.len);
+        for (gnames, group_atoms) |*gn, atom_id| {
+            gn.* = resolved.get(atom_id) orelse .none;
         }
         km.group_names = gnames;
     }
 
-    if (compat_reply.interprets.len > 0) {
-        const interprets = try arena.alloc(SymInterpret, compat_reply.interprets.len);
-        for (compat_reply.interprets, interprets) |ci, *si| {
+    const wire_interprets = compat.interprets();
+    if (wire_interprets.len() > 0) {
+        const interprets = try arena.alloc(SymInterpret, wire_interprets.len());
+        for (interprets, 0..) |*si, i| {
+            const ci = wire_interprets.at(i);
             si.* = .{
+                // Keysym is a non-exhaustive enum, so any wire value is a valid
+                // tag; 0 is XKB's wildcard rather than a symbol.
                 .sym = if (ci.sym == 0) null else @enumFromInt(ci.sym),
-                .match = wireMatchOp(@truncate(ci.match & 0x0F)),
+                .match = wireMatchOp(ci.match & si_op_mask),
                 .mods = @as(u32, ci.mods),
                 .virtual_mod = keymap_mod.mod_index_invalid,
                 .action = decodeXkbAction(ci.action),
-                .level_one_only = (ci.match & 0x80) != 0,
-                .repeat = (ci.flags & 0x02) != 0,
+                .level_one_only = (ci.match & si_level_one_only) != 0,
+                // The old code read bit 1, which is XkbSI_LockingKey, so it
+                // reported repeat for the wrong interprets.
+                .repeat = (ci.flags & si_auto_repeat) != 0,
             };
         }
         km.sym_interprets = interprets;
@@ -271,18 +659,25 @@ pub fn keymapNewFromDevice(ctx: *Context, conn: *xcb.conn.Connection, device_spe
     return km;
 }
 
-/// Build a xkbcommon.Keymap from a parsed XkbGetMap reply.
-/// num_groups is used as the group count fallback when a key's group_info is 0.
-/// names, if provided, supplies real key names from XkbGetNames; otherwise synthetic names are used.
-pub fn keymapFromGetMap(ctx: *Context, map: *const xcb.xkb_map.GetMapReply, num_groups: u8, names: ?*const xcb.xkb_names.GetNamesReply) !*Keymap {
+/// Build a Keymap from a validated XkbGetMap reply.
+///
+/// `num_groups` is the group count to fall back on when a key's group_info says
+/// zero. `names` supplies real key names when present; otherwise keys get
+/// synthetic `K<keycode>` names.
+pub fn keymapFromGetMap(
+    ctx: *Context,
+    map: *const MapView,
+    num_groups: u8,
+    names: ?*const NamesView,
+) !*Keymap {
     const km = try Keymap.create(ctx);
     errdefer km.destroy();
 
     const arena = km.arena.allocator();
 
-    // mods: 8 real mods, Shift..Mod5 in bit order 0..7
+    // The 8 real modifiers, in wire bit order.
     const mod_names = [8][]const u8{ "Shift", "Lock", "Control", "Mod1", "Mod2", "Mod3", "Mod4", "Mod5" };
-    const mods = try arena.alloc(Mod, 8);
+    const mods = try arena.alloc(Mod, mod_names.len);
     for (mods, 0..) |*m, i| {
         m.* = .{
             .name = try ctx.intern(mod_names[i]),
@@ -293,19 +688,16 @@ pub fn keymapFromGetMap(ctx: *Context, map: *const xcb.xkb_map.GetMapReply, num_
     km.mods = .{ .mods = mods };
 
     const types = try arena.alloc(KeyType, map.types.len);
-    for (types, 0..) |*kt, i| {
-        const xtype = &map.types[i];
-
+    for (types, map.types, 0..) |*kt, xtype, i| {
         var name_buf: [32]u8 = undefined;
-        const name_str = try std.fmt.bufPrint(&name_buf, "type{}", .{i});
-        const name_atom = try ctx.intern(name_str);
+        const name_atom = try ctx.intern(try std.fmt.bufPrint(&name_buf, "type{d}", .{i}));
 
-        const entries = try arena.alloc(KeyType.Entry, xtype.entries.len);
+        const entries = try arena.alloc(KeyType.Entry, xtype.map.len());
         for (entries, 0..) |*e, j| {
-            const xe = &xtype.entries[j];
+            const wire_entry = xtype.map.at(j);
             e.* = .{
-                .level = xe.level,
-                .mods = xe.mods_mods,
+                .level = wire_entry.level,
+                .mods = wire_entry.mods_mods,
                 .preserve = 0,
             };
         }
@@ -313,30 +705,21 @@ pub fn keymapFromGetMap(ctx: *Context, map: *const xcb.xkb_map.GetMapReply, num_
         kt.* = .{
             .name = name_atom,
             .mods = xtype.mods_mask,
-            .num_levels = xtype.num_levels,
+            .num_levels = xtype.numLevels,
             .entries = entries,
             .level_names = &.{},
         };
     }
     km.types = types;
 
-    const max_kc: usize = map.header.max_key_code;
-    const min_kc: usize = map.header.min_key_code;
-    const first_key_sym: usize = map.header.first_key_sym;
+    const min_kc: usize = map.reply.minKeyCode;
+    const max_kc: usize = map.reply.maxKeyCode;
+    const first_key_sym: usize = map.reply.firstKeySym;
 
     const keys = try arena.alloc(Key, max_kc + 1);
     for (keys, 0..) |*key, kc| {
         key.* = .{
-            .name = blk: {
-                if (names) |n| {
-                    if (xcb.xkb_names.keyName(n, @intCast(kc))) |name| {
-                        break :blk try ctx.intern(name);
-                    }
-                }
-                var buf: [8]u8 = undefined;
-                const s = try std.fmt.bufPrint(&buf, "K{d}", .{kc});
-                break :blk try ctx.intern(s);
-            },
+            .name = try keyNameAtom(ctx, names, kc),
             .keycode = @intCast(kc),
             .repeats = false,
             .modmap = 0,
@@ -347,42 +730,36 @@ pub fn keymapFromGetMap(ctx: *Context, map: *const xcb.xkb_map.GetMapReply, num_
     }
 
     for (map.modmap) |entry| {
-        const kc: usize = entry.keycode;
-        if (kc <= max_kc) {
-            keys[kc].modmap = entry.mods;
-        }
+        if (entry.keycode <= max_kc) keys[entry.keycode].modmap = entry.mods;
     }
 
+    // parseGetMap rejects max below min, so this range is never inverted.
     for (min_kc..max_kc + 1) |kc| {
         if (kc < first_key_sym) continue;
         const idx = kc - first_key_sym;
         if (idx >= map.syms.len) continue;
 
-        const sm = &map.syms[idx];
-        const ng_raw = xcb.xkb_map.groupCount(sm);
-        const ng: usize = if (ng_raw == 0) @as(usize, num_groups) else ng_raw;
-        if (ng == 0) continue;
+        const ksm = map.syms[idx];
+        const wire_groups = groupCount(ksm);
+        const n_groups: usize = if (wire_groups == 0) @as(usize, num_groups) else wire_groups;
+        if (n_groups == 0) continue;
 
-        const groups = try arena.alloc(Group, ng);
+        const groups = try arena.alloc(Group, n_groups);
         for (groups, 0..) |*g, grp_i| {
-            const kt_raw: usize = sm.kt_index[if (grp_i < 4) grp_i else 3];
-            const type_idx = @min(kt_raw, if (types.len > 0) types.len - 1 else 0);
-            const num_levels: usize = if (types.len > 0) types[type_idx].num_levels else 1;
+            // XKB stores at most 4 group type indices; anything past that
+            // reuses the last one.
+            const kt_slot = @min(grp_i, 3);
+            const kt_raw: usize = if (kt_slot < ksm.kt_index.len) ksm.kt_index[kt_slot] else 0;
+            const type_idx = if (types.len == 0) 0 else @min(kt_raw, types.len - 1);
+            const num_levels: usize = if (types.len == 0) 1 else types[type_idx].num_levels;
 
             const levels = try arena.alloc(Level, num_levels);
             for (levels, 0..) |*lvl, lvl_i| {
-                const sym_val = xcb.xkb_map.symForKey(
-                    map,
-                    @intCast(kc),
-                    @intCast(grp_i),
-                    @intCast(lvl_i),
-                ) orelse 0;
                 const sym_slice = try arena.alloc(Keysym, 1);
+                const sym_val = map.symForKey(@intCast(kc), @intCast(grp_i), @intCast(lvl_i)) orelse 0;
+                // Keysym is non-exhaustive: every 32-bit wire value is a tag.
                 sym_slice[0] = @enumFromInt(sym_val);
-                lvl.* = .{
-                    .syms = sym_slice,
-                    .action = .none,
-                };
+                lvl.* = .{ .syms = sym_slice, .action = .none };
             }
 
             g.* = .{
@@ -406,70 +783,262 @@ pub fn keymapFromGetMap(ctx: *Context, map: *const xcb.xkb_map.GetMapReply, num_
     return km;
 }
 
-test "x11 hermetic: synthetic getmap bytes -> Keymap -> State, kc8='a'/'A'" {
-    // Build a minimal GetMapReply with:
-    //   present=0x0007 (KeyTypes|KeySyms|ModifierMap), minKc=8, maxKc=9
-    //   1 KeyType: mods_mask=Shift(0x1), numLevels=2, 1 map entry (Shift->level1)
-    //   1 KeySymMap for kc8: group_info=1, width=2, syms=[0x61 'a', 0x41 'A']
-    //   1 ModMapEntry: kc=8, mods=0
-    //
-    // The KT map entry is needed so State.getLevel can compute level 1 when Shift
-    // is active (it checks entry.mods == active_mods; entry.mods comes from the
-    // wire mods_mods field at KTMapEntry offset +3).
-    const State = @import("state.zig").State;
-    const ctx = try Context.create(std.testing.allocator, std.testing.io, .{ .no_default_includes = true }, null);
-    defer ctx.destroy();
+/// The interned name for a keycode: the server's name when it has one, else a
+/// synthetic `K<keycode>`.
+fn keyNameAtom(ctx: *Context, names: ?*const NamesView, kc: usize) !Atom {
+    if (kc <= std.math.maxInt(u8)) {
+        if (names) |n| {
+            if (n.keyName(@intCast(kc))) |name| return ctx.intern(name);
+        }
+    }
+    var buf: [8]u8 = undefined;
+    return ctx.intern(try std.fmt.bufPrint(&buf, "K{d}", .{kc}));
+}
 
-    // Layout (offsets):
-    //  [0..40]  fixed header
-    //  [40..48] KeyType header (8 bytes)
-    //  [48..56] KT map entry (8 bytes: active, mods_mask, level, mods_mods, vmods u16, pad u16)
-    //  [56..64] KeySymMap header (8 bytes: kt_index[4], group_info, width, n_syms u16)
-    //  [64..72] 2 keysyms (u32 each)
-    //  [72..76] 1 ModMapEntry (2 bytes) + 2 bytes pad
-    var bytes = [_]u8{0} ** 76;
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
-    // Fixed header (40 bytes)
+test {
+    // keymapNewFromDevice and setupXkb need a live server, so no test calls
+    // them and Zig would never analyse them. Referencing every declaration
+    // forces the test build to type-check them anyway.
+    std.testing.refAllDecls(@This());
+}
+
+/// Write the fixed 40-byte XkbGetMap header of the one-key test map into `bytes`.
+/// kc8 carries 'a'/'A' through a single 2-level Shift key type.
+fn writeOneKeyMapHeader(bytes: []u8) void {
     bytes[10] = 8; // minKeyCode
     bytes[11] = 9; // maxKeyCode
-    std.mem.writeInt(u16, bytes[12..14], 0x0007, native_endian); // present
+    std.mem.writeInt(u16, bytes[12..14], 0x0007, native_endian); // KeyTypes|KeySyms|ModifierMap
     bytes[15] = 1; // nTypes
     bytes[16] = 1; // totalTypes
     bytes[17] = 8; // firstKeySym
     std.mem.writeInt(u16, bytes[18..20], 2, native_endian); // totalSyms
     bytes[20] = 1; // nKeySyms
     bytes[33] = 1; // totalModMapKeys
+}
 
-    // KeyType header at offset 40
-    bytes[40] = 0x01; // mods_mask = Shift bit
+/// The full one-key XkbGetMap reply: header, one KeyType with one map entry,
+/// one KeySymMap for kc8, and one ModifierMap entry.
+fn oneKeyMapReply() [76]u8 {
+    var bytes = [_]u8{0} ** 76;
+    writeOneKeyMapHeader(&bytes);
+
+    // KeyType at 40.
+    bytes[40] = 0x01; // mods_mask = Shift
     bytes[41] = 0x01; // mods_mods
-    std.mem.writeInt(u16, bytes[42..44], 0, native_endian); // mods_vmods
     bytes[44] = 2; // numLevels
-    bytes[45] = 1; // nMapEntries = 1
-    bytes[46] = 0; // hasPreserve = 0
+    bytes[45] = 1; // nMapEntries
+    bytes[46] = 0; // hasPreserve
 
-    // KT map entry at offset 48 (8 bytes)
+    // KTMapEntry at 48: Shift selects level 1.
     bytes[48] = 1; // active
-    bytes[49] = 0x01; // mods_mask = Shift
-    bytes[50] = 1; // level = 1 (becomes entry.level)
-    bytes[51] = 0x01; // mods_mods = Shift (becomes entry.mods in KeyType.Entry)
-    std.mem.writeInt(u16, bytes[52..54], 0, native_endian); // mods_vmods
-    std.mem.writeInt(u16, bytes[54..56], 0, native_endian); // pad
+    bytes[49] = 0x01; // mods_mask
+    bytes[50] = 1; // level
+    bytes[51] = 0x01; // mods_mods
 
-    // KeySymMap at offset 56
-    // bytes[56..60] = kt_index = {0,0,0,0} (already 0)
-    bytes[60] = 1; // group_info: 1 group
+    // KeySymMap at 56: kt_index all zero, 1 group, width 2.
+    bytes[60] = 1; // groupInfo
     bytes[61] = 2; // width
-    std.mem.writeInt(u16, bytes[62..64], 2, native_endian); // n_syms
-    std.mem.writeInt(u32, bytes[64..68], 0x61, native_endian); // sym[0] = 'a'
-    std.mem.writeInt(u32, bytes[68..72], 0x41, native_endian); // sym[1] = 'A'
+    std.mem.writeInt(u16, bytes[62..64], 2, native_endian); // nSyms
+    std.mem.writeInt(u32, bytes[64..68], 0x61, native_endian); // 'a'
+    std.mem.writeInt(u32, bytes[68..72], 0x41, native_endian); // 'A'
 
-    // ModifierMap at offset 72 (1 entry = 2 bytes, padded to 4)
+    // ModMapEntry at 72, padded to 4.
     bytes[72] = 8; // keycode
-    bytes[73] = 0; // mods
-    // bytes[74..76] = 0 (padding)
+    return bytes;
+}
 
-    var map = try xcb.xkb_map.parseGetMap(std.testing.allocator, &bytes);
+test "parseGetMap on the one-key reply yields kc8 level 0 'a' and level 1 'A'" {
+    const bytes = oneKeyMapReply();
+    var map = try parseGetMap(std.testing.allocator, &bytes);
+    defer map.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), map.types.len);
+    try std.testing.expectEqual(@as(u8, 2), map.types[0].numLevels);
+    try std.testing.expectEqual(@as(?u32, 0x61), map.symForKey(8, 0, 0));
+    try std.testing.expectEqual(@as(?u32, 0x41), map.symForKey(8, 0, 1));
+    try std.testing.expectEqual(@as(usize, 1), map.modmap.len);
+    try std.testing.expectEqual(@as(u8, 8), map.modmap[0].keycode);
+}
+
+test "symForKey returns null for a group and a level past the KeySymMap" {
+    const bytes = oneKeyMapReply();
+    var map = try parseGetMap(std.testing.allocator, &bytes);
+    defer map.deinit();
+
+    try std.testing.expectEqual(@as(?u32, null), map.symForKey(8, 1, 0)); // only 1 group
+    try std.testing.expectEqual(@as(?u32, null), map.symForKey(8, 0, 2)); // width is 2
+    try std.testing.expectEqual(@as(?u32, null), map.symForKey(7, 0, 0)); // below firstKeySym
+    try std.testing.expectEqual(@as(?u32, null), map.symForKey(9, 0, 0)); // past the sym list
+}
+
+test "parseGetMap rejects a reply shorter than the 40-byte header" {
+    const tiny = [_]u8{0} ** 39;
+    try std.testing.expectError(error.ShortReply, parseGetMap(std.testing.allocator, &tiny));
+}
+
+test "parseGetMap rejects a KeyType section that runs past the reply" {
+    // nTypes claims 4 types but only the first KeyType header is in the buffer.
+    var bytes = [_]u8{0} ** 48;
+    std.mem.writeInt(u16, bytes[12..14], 0x0001, native_endian); // KeyTypes
+    bytes[15] = 4; // nTypes
+    try std.testing.expectError(error.ShortReply, parseGetMap(std.testing.allocator, &bytes));
+}
+
+test "parseGetMap rejects a KeyType whose map entries run past the reply" {
+    // One KeyType claiming 200 map entries in a buffer that holds none of them.
+    var bytes = [_]u8{0} ** 48;
+    std.mem.writeInt(u16, bytes[12..14], 0x0001, native_endian); // KeyTypes
+    bytes[15] = 1; // nTypes
+    bytes[45] = 200; // nMapEntries
+    try std.testing.expectError(error.ShortReply, parseGetMap(std.testing.allocator, &bytes));
+}
+
+test "parseGetMap rejects a KeySymMap whose keysyms run past the reply" {
+    // One KeySymMap claiming 1000 keysyms with no room for them.
+    var bytes = [_]u8{0} ** 48;
+    std.mem.writeInt(u16, bytes[12..14], 0x0002, native_endian); // KeySyms
+    bytes[20] = 1; // nKeySyms
+    std.mem.writeInt(u16, bytes[46..48], 1000, native_endian); // nSyms of record 0
+    try std.testing.expectError(error.ShortReply, parseGetMap(std.testing.allocator, &bytes));
+}
+
+test "parseGetMap rejects a modifier map that runs past the reply" {
+    var bytes = [_]u8{0} ** 40;
+    std.mem.writeInt(u16, bytes[12..14], 0x0004, native_endian); // ModifierMap
+    bytes[33] = 8; // totalModMapKeys, needs 16 bytes that are not there
+    try std.testing.expectError(error.ShortReply, parseGetMap(std.testing.allocator, &bytes));
+}
+
+test "parseGetMap rejects max_key_code below min_key_code" {
+    var bytes = [_]u8{0} ** 40;
+    bytes[10] = 40; // minKeyCode
+    bytes[11] = 20; // maxKeyCode
+    try std.testing.expectError(error.MalformedReply, parseGetMap(std.testing.allocator, &bytes));
+}
+
+test "parseGetNames reads AC01 for keycode 8 and null for an unnamed key" {
+    // which = KeyNames only; firstKey 8, nKeys 2. kc8 is "AC01", kc9 all zeros.
+    var bytes = [_]u8{0} ** 40;
+    std.mem.writeInt(u32, bytes[8..12], @intFromEnum(xkbproto.NameDetail.KeyNames), native_endian);
+    bytes[18] = 8; // firstKey
+    bytes[19] = 2; // nKeys
+    @memcpy(bytes[32..36], "AC01");
+
+    const names = try parseGetNames(&bytes);
+    try std.testing.expectEqualStrings("AC01", names.keyName(8).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), names.keyName(9));
+    try std.testing.expectEqual(@as(?[]const u8, null), names.keyName(7));
+    try std.testing.expectEqual(@as(?[]const u8, null), names.keyName(10));
+}
+
+test "keyName stops at the first NUL rather than only trimming trailing NULs" {
+    var bytes = [_]u8{0} ** 36;
+    std.mem.writeInt(u32, bytes[8..12], @intFromEnum(xkbproto.NameDetail.KeyNames), native_endian);
+    bytes[18] = 8; // firstKey
+    bytes[19] = 1; // nKeys
+    // "ES\0C": the trailing byte is non-zero, so a trailing-NUL trim would
+    // return all four bytes including the embedded NUL.
+    @memcpy(bytes[32..36], "ES\x00C");
+
+    const names = try parseGetNames(&bytes);
+    try std.testing.expectEqualStrings("ES", names.keyName(8).?);
+}
+
+test "parseGetNames rejects a reply shorter than the 32-byte header" {
+    const tiny = [_]u8{0} ** 31;
+    try std.testing.expectError(error.ShortReply, parseGetNames(&tiny));
+}
+
+test "parseGetControls reads numGroups 2" {
+    var bytes = [_]u8{0} ** 32;
+    bytes[9] = 2;
+    try std.testing.expectEqual(@as(u8, 2), (try parseGetControls(&bytes)).num_groups);
+}
+
+test "parseGetControls rejects a reply that stops before the numGroups byte" {
+    const tiny = [_]u8{0} ** 9;
+    try std.testing.expectError(error.ShortReply, parseGetControls(&tiny));
+}
+
+test "parseGetCompatMap reads two interprets with syms 0x41 and 0xFE02" {
+    var bytes = [_]u8{0} ** 64;
+    // The generated decoder bounds its lists by the reply length field, so a
+    // synthetic reply has to set it: (64 - 32) / 4 = 8 words.
+    std.mem.writeInt(u32, bytes[4..8], 8, native_endian);
+    std.mem.writeInt(u16, bytes[12..14], 2, native_endian); // nSIRtrn
+    std.mem.writeInt(u32, bytes[32..36], 0x41, native_endian);
+    std.mem.writeInt(u32, bytes[48..52], 0xFE02, native_endian);
+
+    const compat = try parseGetCompatMap(&bytes);
+    const list = compat.interprets();
+    try std.testing.expectEqual(@as(usize, 2), list.len());
+    try std.testing.expectEqual(@as(u32, 0x41), list.at(0).sym);
+    try std.testing.expectEqual(@as(u32, 0xFE02), list.at(1).sym);
+}
+
+test "parseGetCompatMap rejects a reply shorter than the 32-byte header" {
+    const tiny = [_]u8{0} ** 31;
+    try std.testing.expectError(error.ShortReply, parseGetCompatMap(&tiny));
+}
+
+test "wireMatchOp maps the five defined ops and sends unknown ops to none" {
+    try std.testing.expectEqual(MatchOp.none_of, wireMatchOp(0));
+    try std.testing.expectEqual(MatchOp.any_of_or_none, wireMatchOp(1));
+    try std.testing.expectEqual(MatchOp.any_of, wireMatchOp(2));
+    try std.testing.expectEqual(MatchOp.all_of, wireMatchOp(3));
+    try std.testing.expectEqual(MatchOp.exactly, wireMatchOp(4));
+    try std.testing.expectEqual(MatchOp.none, wireMatchOp(5));
+    try std.testing.expectEqual(MatchOp.none, wireMatchOp(0x7f));
+}
+
+test "decodeXkbAction reads LockMods realMods 0x04 and keeps unknown types private" {
+    // SIAction.data holds the 7 bytes after the type byte, so for SASetMods
+    // that is flags, mask, realMods, vmodsHigh, vmodsLow, and two pad bytes.
+    const lock_body = [_]u8{ 0x02, 0xff, 0x04, 0, 0, 0, 0 };
+    const lock = decodeXkbAction(.{ .type = 3, .data = &lock_body });
+    try std.testing.expectEqual(Action.ModsAction{
+        .kind = .lock,
+        .mods = 0x04,
+        .mods_by_name = false,
+        .flags = .{ .clear_locks = true },
+    }, lock.mods);
+
+    const terminate = decodeXkbAction(.{ .type = 0x0c, .data = &lock_body });
+    try std.testing.expectEqual(Action.terminate, terminate);
+
+    const unknown_body = [_]u8{ 1, 2, 3, 4, 5, 6, 7 };
+    const unknown = decodeXkbAction(.{ .type = 0x5a, .data = &unknown_body });
+    try std.testing.expectEqual(@as(u8, 0x5a), unknown.private.kind);
+    try std.testing.expectEqualSlices(u8, &unknown_body, &unknown.private.data);
+}
+
+test "decodeXkbAction returns none for an action body cut short" {
+    const short_body = [_]u8{ 1, 2, 3 };
+    try std.testing.expectEqual(Action.none, decodeXkbAction(.{ .type = 1, .data = &short_body }));
+}
+
+test "interpModMatch: exactly needs equality, none_of needs disjoint mods" {
+    try std.testing.expect(interpModMatch(.exactly, 0x05, 0x05));
+    try std.testing.expect(!interpModMatch(.exactly, 0x05, 0x01));
+    try std.testing.expect(interpModMatch(.none_of, 0x02, 0x05));
+    try std.testing.expect(!interpModMatch(.none_of, 0x04, 0x05));
+    try std.testing.expect(interpModMatch(.all_of, 0x05, 0x07));
+    try std.testing.expect(!interpModMatch(.all_of, 0x05, 0x01));
+    try std.testing.expect(interpModMatch(.any_of_or_none, 0x02, 0x00));
+    try std.testing.expect(!interpModMatch(.none, 0x00, 0x00));
+}
+
+test "x11 hermetic: one-key getmap bytes drive a State that reports 'a' then 'A'" {
+    const State = @import("state.zig").State;
+    const ctx = try Context.create(std.testing.allocator, std.testing.io, .{ .no_default_includes = true }, null);
+    defer ctx.destroy();
+
+    const bytes = oneKeyMapReply();
+    var map = try parseGetMap(std.testing.allocator, &bytes);
     defer map.deinit();
 
     const km = try keymapFromGetMap(ctx, &map, 1, null);
@@ -481,4 +1050,26 @@ test "x11 hermetic: synthetic getmap bytes -> Keymap -> State, kc8='a'/'A'" {
     try std.testing.expectEqual(Keysym.fromName("a", .{}).?, st.keyGetOneSym(8));
     _ = st.updateMask(0x1, 0, 0, 0, 0, 0);
     try std.testing.expectEqual(Keysym.fromName("A", .{}).?, st.keyGetOneSym(8));
+}
+
+test "keymapFromGetMap names kc8 from GetNames instead of the synthetic K8" {
+    const ctx = try Context.create(std.testing.allocator, std.testing.io, .{ .no_default_includes = true }, null);
+    defer ctx.destroy();
+
+    const bytes = oneKeyMapReply();
+    var map = try parseGetMap(std.testing.allocator, &bytes);
+    defer map.deinit();
+
+    var name_bytes = [_]u8{0} ** 36;
+    std.mem.writeInt(u32, name_bytes[8..12], @intFromEnum(xkbproto.NameDetail.KeyNames), native_endian);
+    name_bytes[18] = 8; // firstKey
+    name_bytes[19] = 1; // nKeys
+    @memcpy(name_bytes[32..36], "AC01");
+    const names = try parseGetNames(&name_bytes);
+
+    const km = try keymapFromGetMap(ctx, &map, 1, &names);
+    defer km.destroy();
+
+    try std.testing.expectEqualStrings("AC01", ctx.atomText(km.keys[8].name));
+    try std.testing.expectEqualStrings("K9", ctx.atomText(km.keys[9].name));
 }
