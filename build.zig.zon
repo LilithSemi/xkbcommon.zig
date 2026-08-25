@@ -13,8 +13,8 @@
             .hash = "N-V-__8AAJkAZgCO0RI9CmCz9GB-r604Mcghuo2rp7BoteNP",
         },
         .x11 = .{
-            .url = "git+https://github.com/Midstall/x11.zig#3c019b8499dd6ac7603cc21e2e8cb1dfc996fd8c",
-            .hash = "x11-0.1.0-dfzXO7wAEgC-57MgUExNfIJar2UynqB5b8iZfKaKAm2J",
+            .url = "git+https://github.com/Midstall/x11.zig#04671ca8248fb680e76c69f030ebeb477e17c5a0",
+            .hash = "x11-0.1.0-dfzXO1gBEgBerOl7tU_FryfqzfomC-3LVW0i3uv2M3ej",
         },
     },
     .paths = .{ "build.zig.zon", "build.zig", "src", "generator", "data" },
