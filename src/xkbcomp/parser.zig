@@ -470,7 +470,16 @@ pub const Parser = struct {
             },
             .kw_interpret => {
                 self.advance();
-                const sym_tok = try self.expect(.ident);
+                // The keysym is a name, or a number for the ones libxkbcommon has
+                // no name for. The lexer reports `0xff7f` as an integer, which is
+                // correct, so a number is spelled back out as the `0x<hex>` text
+                // that `keysym.fromName` already reads. That keeps the AST one
+                // shape and leaves the consumer unchanged.
+                const sym_text = if (self.tok.type == .integer) blk: {
+                    const v = self.tok.int_val;
+                    self.advance();
+                    break :blk try std.fmt.allocPrint(self.a(), "0x{x}", .{@as(u32, @truncate(@as(u64, @bitCast(v))))});
+                } else (try self.expect(.ident)).text;
                 const match: ?*ast.Expr = if (self.accept(.plus) != null) try self.parseExpr() else null;
                 _ = try self.expect(.obrace);
                 var body: std.ArrayList(ast.VarDef) = .empty;
@@ -480,7 +489,7 @@ pub const Parser = struct {
                 }
                 _ = try self.expect(.cbrace);
                 _ = try self.expect(.semi);
-                return .{ .interp = .{ .merge = merge, .sym = sym_tok.text, .match = match, .body = try body.toOwnedSlice(self.a()) } };
+                return .{ .interp = .{ .merge = merge, .sym = sym_text, .match = match, .body = try body.toOwnedSlice(self.a()) } };
             },
             .kw_indicator => {
                 self.advance();
@@ -1528,4 +1537,30 @@ test "an action argument can be indexed" {
     const vd = try p.parseVarDef();
     try std.testing.expectEqualStrings("action", vd.name.ident);
     try std.testing.expectEqual(@as(usize, 3), vd.value.?.action.args.len);
+}
+
+test "an interpret can name its keysym as a number" {
+    // libxkbcommon emits `interpret 0xff7f+AnyOf(all)` for keysyms it has no
+    // name for; 1.13.2 emits 53 of them in an ordinary keymap. The lexer is
+    // right to call that an integer, so the parser has to accept one here.
+    // Demanding an identifier rejected the whole keymap on the first occurrence.
+    var lexer = Lexer.init(std.testing.allocator, "interpret 0xff7f+AnyOf(all) { repeat= True; };");
+    defer lexer.deinit();
+    var p = Parser.init(std.testing.allocator, &lexer);
+    defer p.deinit();
+
+    const decl = try p.parseDecl();
+    // Kept as the text a keysym lookup understands: `keysym.fromName` already
+    // reads the `0x<hex>` form, so the consumer needs no separate numeric path.
+    try std.testing.expectEqualStrings("0xff7f", decl.interp.sym);
+}
+
+test "a named keysym in an interpret still works" {
+    var lexer = Lexer.init(std.testing.allocator, "interpret Caps_Lock+AnyOf(all) { repeat= True; };");
+    defer lexer.deinit();
+    var p = Parser.init(std.testing.allocator, &lexer);
+    defer p.deinit();
+
+    const decl = try p.parseDecl();
+    try std.testing.expectEqualStrings("Caps_Lock", decl.interp.sym);
 }
