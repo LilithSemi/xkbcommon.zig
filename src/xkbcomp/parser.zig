@@ -305,7 +305,7 @@ pub const Parser = struct {
 
     fn keywordAsText(self: *Parser) ?[]const u8 {
         return switch (self.tok.type) {
-            .kw_key, .kw_type, .kw_action, .kw_group, .kw_indicator, .kw_section, .kw_row, .kw_overlay, .kw_outline, .kw_solid, .kw_text, .kw_shape, .kw_logo, .kw_keys, .kw_virtual, .kw_default, .kw_partial, .kw_hidden => self.tok.text,
+            .kw_key, .kw_interpret, .kw_type, .kw_action, .kw_group, .kw_indicator, .kw_section, .kw_row, .kw_overlay, .kw_outline, .kw_solid, .kw_text, .kw_shape, .kw_logo, .kw_keys, .kw_virtual, .kw_default, .kw_partial, .kw_hidden => self.tok.text,
             else => null,
         };
     }
@@ -429,6 +429,20 @@ pub const Parser = struct {
                 self.advance();
             },
             else => {},
+        }
+
+        // A dot straight after the section keyword is the DEFAULT form:
+        // `interpret.repeat = False;` sets the default for the interpret
+        // declarations that follow, instead of opening a block. Every section
+        // keyword takes it, and no block form has a dot in that position, so one
+        // check here covers them all. xkbcomp emits these in the compat section
+        // of an ordinary keymap, which is what made a real compositor keymap
+        // fail to parse while the hand-written test maps passed.
+        if (self.tok.type != .ident and self.peek().type == .dot) {
+            const lhs = try self.parseExpr();
+            const value: ?*ast.Expr = if (self.accept(.equals) != null) try self.parseExpr() else null;
+            _ = try self.expect(.semi);
+            return .{ .var_def = .{ .merge = merge, .name = lhs, .value = value } };
         }
 
         switch (self.tok.type) {
@@ -778,6 +792,23 @@ pub const Parser = struct {
             val.* = .{ .boolean = false };
             const p = try self.a().create(Expr);
             p.* = .{ .arg = .{ .name = name_tok.text, .value = val } };
+            return p;
+        }
+        // ident[index] = expr is an indexed named arg, which `Private` uses to
+        // fill its payload one byte at a time: `Private(type=0x86,data[0]=0x50)`.
+        // The index is parsed and dropped, because the only consumer of a
+        // private action zeroes its data and keeps the name (see action.zig).
+        // Refusing the syntax outright made every real keymap fail to parse.
+        if (self.tok.type == .ident and self.peek().type == .obracket) {
+            const name_text = self.tok.text;
+            self.advance();
+            _ = try self.expect(.obracket);
+            _ = try self.parseExpr();
+            _ = try self.expect(.cbracket);
+            _ = try self.expect(.equals);
+            const val = try self.parseExpr();
+            const p = try self.a().create(Expr);
+            p.* = .{ .arg = .{ .name = name_text, .value = val } };
             return p;
         }
         // ident = expr is a named arg
@@ -1455,4 +1486,46 @@ test "parseExpr: recursion depth guard returns ParseError (fix 5)" {
     defer p.deinit();
     const result = p.parseExpr();
     try std.testing.expectError(error.ParseError, result);
+}
+
+test "a section keyword followed by a dot is a default, not a block" {
+    // `interpret.repeat = False;` sets the default for the interpret
+    // declarations after it. xkbcomp emits this in the compat section of an
+    // ordinary keymap, so refusing it made every real compositor keymap fail to
+    // parse while the hand-written test maps passed.
+    var lexer = Lexer.init(std.testing.allocator, "interpret.repeat= False;");
+    defer lexer.deinit();
+    var p = Parser.init(std.testing.allocator, &lexer);
+    defer p.deinit();
+
+    const decl = try p.parseDecl();
+    try std.testing.expectEqualStrings("interpret", decl.var_def.name.dot.lhs.ident);
+    try std.testing.expectEqualStrings("repeat", decl.var_def.name.dot.field);
+}
+
+test "the same keyword still opens a block when no dot follows it" {
+    // The two forms share a keyword, so the check that tells them apart must not
+    // swallow the block form.
+    var lexer = Lexer.init(std.testing.allocator, "interpret Foo+AnyOf(all) { repeat= True; };");
+    defer lexer.deinit();
+    var p = Parser.init(std.testing.allocator, &lexer);
+    defer p.deinit();
+
+    const decl = try p.parseDecl();
+    try std.testing.expectEqualStrings("Foo", decl.interp.sym);
+    try std.testing.expectEqual(@as(usize, 1), decl.interp.body.len);
+}
+
+test "an action argument can be indexed" {
+    // `Private(type=0x86,data[0]=0x50)` is how a private action fills its
+    // payload a byte at a time, and real keymaps carry a dozen of them for the
+    // XF86 log keys.
+    var lexer = Lexer.init(std.testing.allocator, "action= Private(type=0x86,data[0]=0x50,data[1]=0x72);");
+    defer lexer.deinit();
+    var p = Parser.init(std.testing.allocator, &lexer);
+    defer p.deinit();
+
+    const vd = try p.parseVarDef();
+    try std.testing.expectEqualStrings("action", vd.name.ident);
+    try std.testing.expectEqual(@as(usize, 3), vd.value.?.action.args.len);
 }
