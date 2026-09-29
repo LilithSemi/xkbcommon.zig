@@ -9,12 +9,12 @@
             .hash = "xml-0.2.0-ZTbP3x07AgAwDNgFEj9liF24YjojTKyznD3-Njf9w5HT",
         },
         .xorgproto = .{
-            .url = "https://gitlab.freedesktop.org/xorg/proto/xorgproto/-/archive/xorgproto-2024.1/xorgproto-xorgproto-2024.1.tar.gz",
-            .hash = "N-V-__8AAJkAZgCO0RI9CmCz9GB-r604Mcghuo2rp7BoteNP",
+            .url = "https://gitlab.com/freedesktop-sdk/mirrors/freedesktop/xorg/proto/xorgproto/-/archive/xorgproto-2025.1/xorgproto-xorgproto-2025.1.tar.gz",
+            .hash = "N-V-__8AAG86ZgA2-SHGTO4n81-Sj8LNvSASCKZ91wOWZ7Sg",
         },
         .x11 = .{
-            .url = "git+https://github.com/Midstall/x11.zig#04671ca8248fb680e76c69f030ebeb477e17c5a0",
-            .hash = "x11-0.1.0-dfzXO1gBEgBerOl7tU_FryfqzfomC-3LVW0i3uv2M3ej",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/x11.zig#131dc6b23bb49e4a97e4a05bab244ee625a9bbc4",
+            .hash = "x11-0.1.0-dfzXO3ABEgAGtEaf2o2K8DEewTlC0J732WTQ5MdbvuGC",
         },
     },
     .paths = .{ "build.zig.zon", "build.zig", "src", "generator", "data" },
