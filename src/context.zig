@@ -188,7 +188,7 @@ pub const Context = struct {
     }
 
     pub fn log(self: *Context, level: LogLevel, comptime fmt: []const u8, args: anytype) void {
-        if (@intFromEnum(level) > @intFromEnum(self.log_level)) return;
+        if (@backingInt(level) > @backingInt(self.log_level)) return;
         var buf: [1024]u8 = undefined;
         // drop cleanly on overflow rather than returning garbage bytes
         const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..0];
@@ -209,14 +209,14 @@ pub const Context = struct {
         try self.atom_list.append(self.allocator, dup);
         // roll back append if put fails so list and map stay in sync
         errdefer _ = self.atom_list.pop();
-        const id: Atom = @enumFromInt(self.atom_list.items.len);
+        const id: Atom = @fromBackingInt(@intCast(self.atom_list.items.len));
         try self.atom_map.put(dup, id);
         return id;
     }
 
     pub fn atomText(self: *const Context, atom: Atom) []const u8 {
         if (atom == .none) return "";
-        return self.atom_list.items[@intFromEnum(atom) - 1];
+        return self.atom_list.items[@backingInt(atom) - 1];
     }
 
     pub fn includePathAppend(self: *Context, path: []const u8) !void {
@@ -306,7 +306,7 @@ test "atom intern dedups and round-trips" {
     try std.testing.expect(a != c);
     try std.testing.expectEqualStrings("Return", ctx.atomText(a));
     try std.testing.expectEqualStrings("space", ctx.atomText(c));
-    try std.testing.expectEqual(Atom.none, @as(Atom, @enumFromInt(0)));
+    try std.testing.expectEqual(Atom.none, @as(Atom, @fromBackingInt(@intCast(0))));
     try std.testing.expectEqualStrings("", ctx.atomText(.none));
 }
 
@@ -378,7 +378,7 @@ test "log overflow drops message cleanly" {
     ctx.setLogLevel(.debug);
     test_len = 99; // sentinel: captureLog must overwrite this
     // Feed a 2048-byte string to exceed the 1024-byte bufPrint buffer
-    const long_arr = [_]u8{'x'} ** 2048;
+    const long_arr: [2048]u8 = @splat('x');
     ctx.log(.debug, "{s}", .{long_arr[0..]});
     // bufPrint overflows -> catch returns buf[0..0]; captureLog sees msg.len == 0
     try std.testing.expectEqual(@as(usize, 0), test_len);

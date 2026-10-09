@@ -505,8 +505,8 @@ test "tokenize keycodes + lone slash" {
 
 test "fix1: unknown chars yield .err tokens, no stack overflow" {
     // 5000 '@' chars must each lex as .err without recursing (stack safe)
-    const src = "@" ** 5000;
-    var lx = Lexer.init(std.testing.allocator, src);
+    const src: [5000]u8 = @splat('@');
+    var lx = Lexer.init(std.testing.allocator, &src);
     defer lx.deinit();
     var i: usize = 0;
     while (i < 5000) : (i += 1) {

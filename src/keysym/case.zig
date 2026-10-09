@@ -157,63 +157,63 @@ fn convert(v: u32) Cased {
 }
 
 pub fn toLower(ks: Keysym) Keysym {
-    return @enumFromInt(convert(@intFromEnum(ks)).lower);
+    return @fromBackingInt(@intCast(convert(@backingInt(ks)).lower));
 }
 
 pub fn toUpper(ks: Keysym) Keysym {
-    return @enumFromInt(convert(@intFromEnum(ks)).upper);
+    return @fromBackingInt(@intCast(convert(@backingInt(ks)).upper));
 }
 
 const std = @import("std");
 const k = @import("../keysym.zig");
 
 test "ascii case" {
-    try std.testing.expectEqual(@as(u32, 0x0061), @intFromEnum(k.toLower(@enumFromInt(0x0041)))); // A->a
-    try std.testing.expectEqual(@as(u32, 0x0041), @intFromEnum(k.toUpper(@enumFromInt(0x0061)))); // a->A
+    try std.testing.expectEqual(@as(u32, 0x0061), @backingInt(k.toLower(@fromBackingInt(@intCast(0x0041))))); // A->a
+    try std.testing.expectEqual(@as(u32, 0x0041), @backingInt(k.toUpper(@fromBackingInt(@intCast(0x0061))))); // a->A
 }
 
 test "latin1 accented" {
-    try std.testing.expectEqual(@as(u32, 0x00e9), @intFromEnum(k.toLower(@enumFromInt(0x00c9)))); // Eacute->eacute
-    try std.testing.expectEqual(@as(u32, 0x00c9), @intFromEnum(k.toUpper(@enumFromInt(0x00e9))));
+    try std.testing.expectEqual(@as(u32, 0x00e9), @backingInt(k.toLower(@fromBackingInt(@intCast(0x00c9))))); // Eacute->eacute
+    try std.testing.expectEqual(@as(u32, 0x00c9), @backingInt(k.toUpper(@fromBackingInt(@intCast(0x00e9)))));
 }
 
 test "no case pair unchanged" {
-    try std.testing.expectEqual(@as(u32, 0xff0d), @intFromEnum(k.toUpper(@enumFromInt(0xff0d)))); // Return
-    try std.testing.expectEqual(@as(u32, 0x00d7), @intFromEnum(k.toLower(@enumFromInt(0x00d7)))); // multiply sign
+    try std.testing.expectEqual(@as(u32, 0xff0d), @backingInt(k.toUpper(@fromBackingInt(@intCast(0xff0d))))); // Return
+    try std.testing.expectEqual(@as(u32, 0x00d7), @backingInt(k.toLower(@fromBackingInt(@intCast(0x00d7))))); // multiply sign
 }
 
 test "latin2 case" {
     // Aogonek (0x1a1) <-> aogonek (0x1b1)
-    try std.testing.expectEqual(@as(u32, 0x1b1), @intFromEnum(k.toLower(@enumFromInt(0x1a1))));
-    try std.testing.expectEqual(@as(u32, 0x1a1), @intFromEnum(k.toUpper(@enumFromInt(0x1b1))));
+    try std.testing.expectEqual(@as(u32, 0x1b1), @backingInt(k.toLower(@fromBackingInt(@intCast(0x1a1)))));
+    try std.testing.expectEqual(@as(u32, 0x1a1), @backingInt(k.toUpper(@fromBackingInt(@intCast(0x1b1)))));
     // breve (0x1a2) has no case pair
-    try std.testing.expectEqual(@as(u32, 0x1a2), @intFromEnum(k.toLower(@enumFromInt(0x1a2))));
-    try std.testing.expectEqual(@as(u32, 0x1a2), @intFromEnum(k.toUpper(@enumFromInt(0x1a2))));
+    try std.testing.expectEqual(@as(u32, 0x1a2), @backingInt(k.toLower(@fromBackingInt(@intCast(0x1a2)))));
+    try std.testing.expectEqual(@as(u32, 0x1a2), @backingInt(k.toUpper(@fromBackingInt(@intCast(0x1a2)))));
     // Racute (0x1c0) <-> racute (0x1e0)
-    try std.testing.expectEqual(@as(u32, 0x1e0), @intFromEnum(k.toLower(@enumFromInt(0x1c0))));
-    try std.testing.expectEqual(@as(u32, 0x1c0), @intFromEnum(k.toUpper(@enumFromInt(0x1e0))));
+    try std.testing.expectEqual(@as(u32, 0x1e0), @backingInt(k.toLower(@fromBackingInt(@intCast(0x1c0)))));
+    try std.testing.expectEqual(@as(u32, 0x1c0), @backingInt(k.toUpper(@fromBackingInt(@intCast(0x1e0)))));
 }
 
 test "cyrillic case" {
     // Cyrillic_A (0x6e1) <-> Cyrillic_a (0x6c1)
-    try std.testing.expectEqual(@as(u32, 0x6c1), @intFromEnum(k.toLower(@enumFromInt(0x6e1))));
-    try std.testing.expectEqual(@as(u32, 0x6e1), @intFromEnum(k.toUpper(@enumFromInt(0x6c1))));
+    try std.testing.expectEqual(@as(u32, 0x6c1), @backingInt(k.toLower(@fromBackingInt(@intCast(0x6e1)))));
+    try std.testing.expectEqual(@as(u32, 0x6e1), @backingInt(k.toUpper(@fromBackingInt(@intCast(0x6c1)))));
     // Serbian_DJE (0x6b1) <-> Serbian_dje (0x6a1)
-    try std.testing.expectEqual(@as(u32, 0x6a1), @intFromEnum(k.toLower(@enumFromInt(0x6b1))));
-    try std.testing.expectEqual(@as(u32, 0x6b1), @intFromEnum(k.toUpper(@enumFromInt(0x6a1))));
+    try std.testing.expectEqual(@as(u32, 0x6a1), @backingInt(k.toLower(@fromBackingInt(@intCast(0x6b1)))));
+    try std.testing.expectEqual(@as(u32, 0x6b1), @backingInt(k.toUpper(@fromBackingInt(@intCast(0x6a1)))));
     // numerosign (0x6b0) has no case pair
-    try std.testing.expectEqual(@as(u32, 0x6b0), @intFromEnum(k.toLower(@enumFromInt(0x6b0))));
+    try std.testing.expectEqual(@as(u32, 0x6b0), @backingInt(k.toLower(@fromBackingInt(@intCast(0x6b0)))));
 }
 
 test "greek case" {
     // Greek_ALPHA (0x7c1) <-> Greek_alpha (0x7e1)
-    try std.testing.expectEqual(@as(u32, 0x7e1), @intFromEnum(k.toLower(@enumFromInt(0x7c1))));
-    try std.testing.expectEqual(@as(u32, 0x7c1), @intFromEnum(k.toUpper(@enumFromInt(0x7e1))));
+    try std.testing.expectEqual(@as(u32, 0x7e1), @backingInt(k.toLower(@fromBackingInt(@intCast(0x7c1)))));
+    try std.testing.expectEqual(@as(u32, 0x7c1), @backingInt(k.toUpper(@fromBackingInt(@intCast(0x7e1)))));
     // Greek_ALPHAaccent (0x7a1) <-> Greek_alphaaccent (0x7b1)
-    try std.testing.expectEqual(@as(u32, 0x7b1), @intFromEnum(k.toLower(@enumFromInt(0x7a1))));
-    try std.testing.expectEqual(@as(u32, 0x7a1), @intFromEnum(k.toUpper(@enumFromInt(0x7b1))));
+    try std.testing.expectEqual(@as(u32, 0x7b1), @backingInt(k.toLower(@fromBackingInt(@intCast(0x7a1)))));
+    try std.testing.expectEqual(@as(u32, 0x7a1), @backingInt(k.toUpper(@fromBackingInt(@intCast(0x7b1)))));
     // Greek_finalsmallsigma (0x7f3) has no uppercase pair
-    try std.testing.expectEqual(@as(u32, 0x7f3), @intFromEnum(k.toUpper(@enumFromInt(0x7f3))));
+    try std.testing.expectEqual(@as(u32, 0x7f3), @backingInt(k.toUpper(@fromBackingInt(@intCast(0x7f3)))));
     // Greek_iotaaccentdieresis (0x7b6) has no uppercase pair
-    try std.testing.expectEqual(@as(u32, 0x7b6), @intFromEnum(k.toUpper(@enumFromInt(0x7b6))));
+    try std.testing.expectEqual(@as(u32, 0x7b6), @backingInt(k.toUpper(@fromBackingInt(@intCast(0x7b6)))));
 }

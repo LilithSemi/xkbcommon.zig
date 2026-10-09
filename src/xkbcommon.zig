@@ -58,16 +58,16 @@ test "name round-trips across a sample" {
     const samples = [_]u32{ 0x0041, 0xff0d, 0x00e9, 0x01a1, 0xff67, 0x0020 };
     var buf: [64]u8 = undefined;
     for (samples) |v| {
-        const ks: Keysym = @enumFromInt(v);
+        const ks: Keysym = @fromBackingInt(@intCast(v));
         const name = try ks.getName(&buf);
         const back = keysym.fromName(name, .{}) orelse return error.Missing;
-        try std.testing.expectEqual(v, @intFromEnum(back));
+        try std.testing.expectEqual(v, @backingInt(back));
     }
 }
 
 test "unicode round-trips" {
-    try std.testing.expectEqual(@as(u21, 'A'), (@as(Keysym, @enumFromInt(keysym.keys.A))).toUtf32());
-    try std.testing.expectEqual(@as(u32, 0x01a1), @intFromEnum(Keysym.fromUtf32(0x0104)));
+    try std.testing.expectEqual(@as(u21, 'A'), (@as(Keysym, @fromBackingInt(@intCast(keysym.keys.A)))).toUtf32());
+    try std.testing.expectEqual(@as(u32, 0x01a1), @backingInt(Keysym.fromUtf32(0x0104)));
 }
 
 test "named constants resolve" {

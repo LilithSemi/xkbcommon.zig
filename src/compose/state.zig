@@ -32,7 +32,7 @@ const modifier_values = [_]u32{
 };
 
 fn isModifier(ks: Keysym) bool {
-    const val = @intFromEnum(ks);
+    const val = @backingInt(ks);
     for (modifier_values) |m| {
         if (val == m) return true;
     }

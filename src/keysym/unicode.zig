@@ -3,7 +3,7 @@ const Keysym = @import("../keysym.zig").Keysym;
 const tables = @import("keysym_tables");
 
 pub fn toUtf32(ks: Keysym) u21 {
-    const v: u32 = @intFromEnum(ks);
+    const v: u32 = @backingInt(ks);
     if ((v >= 0x20 and v <= 0x7e) or (v >= 0xa0 and v <= 0xff)) return @intCast(v);
     if (v >= 0x01000100 and v <= 0x0110ffff) return @intCast(v - 0x01000000);
     return legacyToUtf32(v);
@@ -20,8 +20,8 @@ pub fn toUtf8(ks: Keysym, buf: []u8) ?[]const u8 {
 
 pub fn fromUtf32(cp: u21) Keysym {
     if (legacyFromUtf32(cp)) |ks| return ks;
-    if ((cp >= 0x20 and cp <= 0x7e) or (cp >= 0xa0 and cp <= 0xff)) return @enumFromInt(@as(u32, cp));
-    if (cp >= 0x100 and cp <= 0x10ffff) return @enumFromInt(@as(u32, cp) + 0x01000000);
+    if ((cp >= 0x20 and cp <= 0x7e) or (cp >= 0xa0 and cp <= 0xff)) return @fromBackingInt(@intCast(@as(u32, cp)));
+    if (cp >= 0x100 and cp <= 0x10ffff) return @fromBackingInt(@intCast(@as(u32, cp) + 0x01000000));
     return .no_symbol;
 }
 
@@ -42,62 +42,62 @@ fn legacyFromUtf32(cp: u21) ?Keysym {
     var hi: usize = items.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        if (items[mid].unicode < cp) lo = mid + 1 else if (items[mid].unicode > cp) hi = mid else return @enumFromInt(items[mid].keysym);
+        if (items[mid].unicode < cp) lo = mid + 1 else if (items[mid].unicode > cp) hi = mid else return @fromBackingInt(@intCast(items[mid].keysym));
     }
     return null;
 }
 
 test "ascii and latin1 direct" {
-    try std.testing.expectEqual(@as(u21, 'A'), toUtf32(@enumFromInt(0x0041)));
-    try std.testing.expectEqual(@as(u21, 0x00e9), toUtf32(@enumFromInt(0x00e9)));
+    try std.testing.expectEqual(@as(u21, 'A'), toUtf32(@fromBackingInt(@intCast(0x0041))));
+    try std.testing.expectEqual(@as(u21, 0x00e9), toUtf32(@fromBackingInt(@intCast(0x00e9))));
 }
 
 test "unicode-range keysym" {
-    try std.testing.expectEqual(@as(u21, 0x0104), toUtf32(@enumFromInt(0x01000104)));
+    try std.testing.expectEqual(@as(u21, 0x0104), toUtf32(@fromBackingInt(@intCast(0x01000104))));
 }
 
 test "fromUtf32 ascii and high" {
-    try std.testing.expectEqual(@as(u32, 0x0041), @intFromEnum(fromUtf32('A')));
-    try std.testing.expectEqual(@as(u32, 0x0101F600), @intFromEnum(fromUtf32(0x1F600)));
+    try std.testing.expectEqual(@as(u32, 0x0041), @backingInt(fromUtf32('A')));
+    try std.testing.expectEqual(@as(u32, 0x0101F600), @backingInt(fromUtf32(0x1F600)));
 }
 
 test "legacy keysym to unicode" {
     // XK_Aogonek 0x01a1 -> U+0104
-    try std.testing.expectEqual(@as(u21, 0x0104), toUtf32(@enumFromInt(0x01a1)));
+    try std.testing.expectEqual(@as(u21, 0x0104), toUtf32(@fromBackingInt(@intCast(0x01a1))));
 }
 
 test "legacy unicode to keysym reversible" {
-    try std.testing.expectEqual(@as(u32, 0x01a1), @intFromEnum(fromUtf32(0x0104)));
+    try std.testing.expectEqual(@as(u32, 0x01a1), @backingInt(fromUtf32(0x0104)));
 }
 
 test "non-reversible unicode does not map back to legacy" {
     // U+2022 BULLET has a keysym (0xb7 via non-reversible enfilledbox), but no reversible mapping;
     // fromUtf32 should fall through to the unicode-range path
-    try std.testing.expectEqual(@as(u32, 0x01002022), @intFromEnum(fromUtf32(0x2022)));
+    try std.testing.expectEqual(@as(u32, 0x01002022), @backingInt(fromUtf32(0x2022)));
 }
 
 test "toUtf8 ascii" {
     var buf: [8]u8 = undefined;
-    try std.testing.expectEqualStrings("A", toUtf8(@enumFromInt(0x0041), &buf).?);
+    try std.testing.expectEqualStrings("A", toUtf8(@fromBackingInt(@intCast(0x0041)), &buf).?);
 }
 test "toUtf8 multibyte" {
     var buf: [8]u8 = undefined;
-    try std.testing.expectEqualStrings("\u{0104}", toUtf8(@enumFromInt(0x01a1), &buf).?);
+    try std.testing.expectEqualStrings("\u{0104}", toUtf8(@fromBackingInt(@intCast(0x01a1)), &buf).?);
 }
 test "toUtf8 no mapping returns null" {
     var buf: [8]u8 = undefined;
-    try std.testing.expect(toUtf8(@enumFromInt(0xff67), &buf) == null);
+    try std.testing.expect(toUtf8(@fromBackingInt(@intCast(0xff67)), &buf) == null);
 }
 test "toUtf8 too small returns null" {
     var buf: [1]u8 = undefined;
-    try std.testing.expect(toUtf8(@enumFromInt(0x01a1), &buf) == null);
+    try std.testing.expect(toUtf8(@fromBackingInt(@intCast(0x01a1)), &buf) == null);
 }
 
 test "fromUtf32 canonical keysym for shared codepoints" {
     // space: canonical is XK_space 0x0020, not KP_Space 0xff80
-    try std.testing.expectEqual(@as(u32, 0x0020), @intFromEnum(fromUtf32(0x20)));
+    try std.testing.expectEqual(@as(u32, 0x0020), @backingInt(fromUtf32(0x20)));
     // digit 5: canonical is XK_5 0x0035, not KP_5 0xffb5
-    try std.testing.expectEqual(@as(u32, 0x0035), @intFromEnum(fromUtf32('5')));
+    try std.testing.expectEqual(@as(u32, 0x0035), @backingInt(fromUtf32('5')));
     // carriage return: canonical is XK_Return 0xff0d, not KP_Enter 0xff8d
-    try std.testing.expectEqual(@as(u32, 0xff0d), @intFromEnum(fromUtf32(0x000d)));
+    try std.testing.expectEqual(@as(u32, 0xff0d), @backingInt(fromUtf32(0x000d)));
 }

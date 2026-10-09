@@ -124,7 +124,7 @@ pub fn compileCompat(
 ) !CompatInfo {
     var interprets: std.ArrayListUnmanaged(SymInterpret) = .empty;
     var leds: std.ArrayListUnmanaged(Led) = .empty;
-    var group_compat: [5]?ModMask = .{null} ** 5;
+    var group_compat: [5]?ModMask = @splat(null);
 
     for (comp.decls) |decl| {
         switch (decl) {

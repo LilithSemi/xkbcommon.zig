@@ -63,14 +63,14 @@ const reply_header_len: usize = 32;
 const controls_num_groups_offset: usize = 9;
 
 /// Ask XkbGetNames for every name section the protocol defines (bits 0 to 13).
-const names_which_all: u32 = (@as(u32, @intFromEnum(xkbproto.NameDetail.RGNames)) << 1) - 1;
+const names_which_all: u32 = (@as(u32, @backingInt(xkbproto.NameDetail.RGNames)) << 1) - 1;
 /// Ask XkbGetMap for every map component (bits 0 to 7).
-const map_full_all: u16 = (@as(u16, @intFromEnum(xkbproto.MapPart.VirtualModMap)) << 1) - 1;
+const map_full_all: u16 = (@as(u16, @backingInt(xkbproto.MapPart.VirtualModMap)) << 1) - 1;
 
 // The bindings declare the SymInterpret match bits as enum(u32), but the wire
 // field is one byte, so narrow them once here instead of at every use.
-const si_op_mask: u8 = @intFromEnum(xkbproto.SymInterpMatch.OpMask);
-const si_level_one_only: u8 = @intFromEnum(xkbproto.SymInterpMatch.LevelOneOnly);
+const si_op_mask: u8 = @backingInt(xkbproto.SymInterpMatch.OpMask);
+const si_level_one_only: u8 = @backingInt(xkbproto.SymInterpMatch.LevelOneOnly);
 /// XkbSI_AutoRepeat, from X11/extensions/XKB.h.
 const si_auto_repeat: u8 = 1 << 0;
 
@@ -118,7 +118,7 @@ fn validateGetMap(bytes: []const u8) DecodeError!void {
 
     var off: usize = map_header_len;
 
-    if (present & @intFromEnum(xkbproto.MapPart.KeyTypes) != 0) {
+    if (present & @backingInt(xkbproto.MapPart.KeyTypes) != 0) {
         for (0..n_types) |_| {
             if (try addChecked(off, key_type_header_len) > bytes.len) return error.ShortReply;
             const n_entries: usize = bytes[off + 5];
@@ -130,7 +130,7 @@ fn validateGetMap(bytes: []const u8) DecodeError!void {
         }
     }
 
-    if (present & @intFromEnum(xkbproto.MapPart.KeySyms) != 0) {
+    if (present & @backingInt(xkbproto.MapPart.KeySyms) != 0) {
         for (0..n_key_syms) |_| {
             if (try addChecked(off, key_sym_map_len) > bytes.len) return error.ShortReply;
             const n_syms: usize = std.mem.readInt(u16, bytes[off + 6 ..][0..2], native_endian);
@@ -141,34 +141,34 @@ fn validateGetMap(bytes: []const u8) DecodeError!void {
     }
 
     // Key actions are a count byte per key, padded to 4, then the action bodies.
-    if (present & @intFromEnum(xkbproto.MapPart.KeyActions) != 0) {
+    if (present & @backingInt(xkbproto.MapPart.KeyActions) != 0) {
         off = try align4(try addChecked(off, n_key_actions));
         off = try addChecked(off, try mulChecked(total_actions, action_len));
         if (off > bytes.len) return error.ShortReply;
     }
 
-    if (present & @intFromEnum(xkbproto.MapPart.KeyBehaviors) != 0) {
+    if (present & @backingInt(xkbproto.MapPart.KeyBehaviors) != 0) {
         off = try addChecked(off, try mulChecked(total_key_behaviors, set_behavior_len));
         if (off > bytes.len) return error.ShortReply;
     }
 
     // One byte per virtual modifier that the virtualMods mask names.
-    if (present & @intFromEnum(xkbproto.MapPart.VirtualMods) != 0) {
+    if (present & @backingInt(xkbproto.MapPart.VirtualMods) != 0) {
         off = try align4(try addChecked(off, @popCount(virtual_mods)));
         if (off > bytes.len) return error.ShortReply;
     }
 
-    if (present & @intFromEnum(xkbproto.MapPart.ExplicitComponents) != 0) {
+    if (present & @backingInt(xkbproto.MapPart.ExplicitComponents) != 0) {
         off = try align4(try addChecked(off, try mulChecked(total_key_explicit, set_explicit_len)));
         if (off > bytes.len) return error.ShortReply;
     }
 
-    if (present & @intFromEnum(xkbproto.MapPart.ModifierMap) != 0) {
+    if (present & @backingInt(xkbproto.MapPart.ModifierMap) != 0) {
         off = try align4(try addChecked(off, try mulChecked(total_mod_map_keys, key_mod_map_len)));
         if (off > bytes.len) return error.ShortReply;
     }
 
-    if (present & @intFromEnum(xkbproto.MapPart.VirtualModMap) != 0) {
+    if (present & @backingInt(xkbproto.MapPart.VirtualModMap) != 0) {
         off = try addChecked(off, try mulChecked(total_vmod_map_keys, key_vmod_map_len));
         if (off > bytes.len) return error.ShortReply;
     }
@@ -641,7 +641,7 @@ pub fn keymapNewFromDevice(ctx: *Context, client: *x11.Client, device_spec: u16)
             si.* = .{
                 // Keysym is a non-exhaustive enum, so any wire value is a valid
                 // tag; 0 is XKB's wildcard rather than a symbol.
-                .sym = if (ci.sym == 0) null else @enumFromInt(ci.sym),
+                .sym = if (ci.sym == 0) null else @fromBackingInt(@intCast(ci.sym)),
                 .match = wireMatchOp(ci.match & si_op_mask),
                 .mods = @as(u32, ci.mods),
                 .virtual_mod = keymap_mod.mod_index_invalid,
@@ -758,7 +758,7 @@ pub fn keymapFromGetMap(
                 const sym_slice = try arena.alloc(Keysym, 1);
                 const sym_val = map.symForKey(@intCast(kc), @intCast(grp_i), @intCast(lvl_i)) orelse 0;
                 // Keysym is non-exhaustive: every 32-bit wire value is a tag.
-                sym_slice[0] = @enumFromInt(sym_val);
+                sym_slice[0] = @fromBackingInt(@intCast(sym_val));
                 lvl.* = .{ .syms = sym_slice, .action = .none };
             }
 
@@ -823,7 +823,7 @@ fn writeOneKeyMapHeader(bytes: []u8) void {
 /// The full one-key XkbGetMap reply: header, one KeyType with one map entry,
 /// one KeySymMap for kc8, and one ModifierMap entry.
 fn oneKeyMapReply() [76]u8 {
-    var bytes = [_]u8{0} ** 76;
+    var bytes: [76]u8 = @splat(0);
     writeOneKeyMapHeader(&bytes);
 
     // KeyType at 40.
@@ -876,13 +876,13 @@ test "symForKey returns null for a group and a level past the KeySymMap" {
 }
 
 test "parseGetMap rejects a reply shorter than the 40-byte header" {
-    const tiny = [_]u8{0} ** 39;
+    const tiny: [39]u8 = @splat(0);
     try std.testing.expectError(error.ShortReply, parseGetMap(std.testing.allocator, &tiny));
 }
 
 test "parseGetMap rejects a KeyType section that runs past the reply" {
     // nTypes claims 4 types but only the first KeyType header is in the buffer.
-    var bytes = [_]u8{0} ** 48;
+    var bytes: [48]u8 = @splat(0);
     std.mem.writeInt(u16, bytes[12..14], 0x0001, native_endian); // KeyTypes
     bytes[15] = 4; // nTypes
     try std.testing.expectError(error.ShortReply, parseGetMap(std.testing.allocator, &bytes));
@@ -890,7 +890,7 @@ test "parseGetMap rejects a KeyType section that runs past the reply" {
 
 test "parseGetMap rejects a KeyType whose map entries run past the reply" {
     // One KeyType claiming 200 map entries in a buffer that holds none of them.
-    var bytes = [_]u8{0} ** 48;
+    var bytes: [48]u8 = @splat(0);
     std.mem.writeInt(u16, bytes[12..14], 0x0001, native_endian); // KeyTypes
     bytes[15] = 1; // nTypes
     bytes[45] = 200; // nMapEntries
@@ -899,7 +899,7 @@ test "parseGetMap rejects a KeyType whose map entries run past the reply" {
 
 test "parseGetMap rejects a KeySymMap whose keysyms run past the reply" {
     // One KeySymMap claiming 1000 keysyms with no room for them.
-    var bytes = [_]u8{0} ** 48;
+    var bytes: [48]u8 = @splat(0);
     std.mem.writeInt(u16, bytes[12..14], 0x0002, native_endian); // KeySyms
     bytes[20] = 1; // nKeySyms
     std.mem.writeInt(u16, bytes[46..48], 1000, native_endian); // nSyms of record 0
@@ -907,14 +907,14 @@ test "parseGetMap rejects a KeySymMap whose keysyms run past the reply" {
 }
 
 test "parseGetMap rejects a modifier map that runs past the reply" {
-    var bytes = [_]u8{0} ** 40;
+    var bytes: [48]u8 = @splat(0);
     std.mem.writeInt(u16, bytes[12..14], 0x0004, native_endian); // ModifierMap
     bytes[33] = 8; // totalModMapKeys, needs 16 bytes that are not there
     try std.testing.expectError(error.ShortReply, parseGetMap(std.testing.allocator, &bytes));
 }
 
 test "parseGetMap rejects max_key_code below min_key_code" {
-    var bytes = [_]u8{0} ** 40;
+    var bytes: [48]u8 = @splat(0);
     bytes[10] = 40; // minKeyCode
     bytes[11] = 20; // maxKeyCode
     try std.testing.expectError(error.MalformedReply, parseGetMap(std.testing.allocator, &bytes));
@@ -922,8 +922,8 @@ test "parseGetMap rejects max_key_code below min_key_code" {
 
 test "parseGetNames reads AC01 for keycode 8 and null for an unnamed key" {
     // which = KeyNames only; firstKey 8, nKeys 2. kc8 is "AC01", kc9 all zeros.
-    var bytes = [_]u8{0} ** 40;
-    std.mem.writeInt(u32, bytes[8..12], @intFromEnum(xkbproto.NameDetail.KeyNames), native_endian);
+    var bytes: [48]u8 = @splat(0);
+    std.mem.writeInt(u32, bytes[8..12], @backingInt(xkbproto.NameDetail.KeyNames), native_endian);
     bytes[18] = 8; // firstKey
     bytes[19] = 2; // nKeys
     @memcpy(bytes[32..36], "AC01");
@@ -936,8 +936,8 @@ test "parseGetNames reads AC01 for keycode 8 and null for an unnamed key" {
 }
 
 test "keyName stops at the first NUL rather than only trimming trailing NULs" {
-    var bytes = [_]u8{0} ** 36;
-    std.mem.writeInt(u32, bytes[8..12], @intFromEnum(xkbproto.NameDetail.KeyNames), native_endian);
+    var bytes: [36]u8 = @splat(0);
+    std.mem.writeInt(u32, bytes[8..12], @backingInt(xkbproto.NameDetail.KeyNames), native_endian);
     bytes[18] = 8; // firstKey
     bytes[19] = 1; // nKeys
     // "ES\0C": the trailing byte is non-zero, so a trailing-NUL trim would
@@ -949,23 +949,23 @@ test "keyName stops at the first NUL rather than only trimming trailing NULs" {
 }
 
 test "parseGetNames rejects a reply shorter than the 32-byte header" {
-    const tiny = [_]u8{0} ** 31;
+    const tiny: [31]u8 = @splat(0);
     try std.testing.expectError(error.ShortReply, parseGetNames(&tiny));
 }
 
 test "parseGetControls reads numGroups 2" {
-    var bytes = [_]u8{0} ** 32;
+    var bytes: [32]u8 = @splat(0);
     bytes[9] = 2;
     try std.testing.expectEqual(@as(u8, 2), (try parseGetControls(&bytes)).num_groups);
 }
 
 test "parseGetControls rejects a reply that stops before the numGroups byte" {
-    const tiny = [_]u8{0} ** 9;
+    const tiny: [9]u8 = @splat(0);
     try std.testing.expectError(error.ShortReply, parseGetControls(&tiny));
 }
 
 test "parseGetCompatMap reads two interprets with syms 0x41 and 0xFE02" {
-    var bytes = [_]u8{0} ** 64;
+    var bytes: [64]u8 = @splat(0);
     // The generated decoder bounds its lists by the reply length field, so a
     // synthetic reply has to set it: (64 - 32) / 4 = 8 words.
     std.mem.writeInt(u32, bytes[4..8], 8, native_endian);
@@ -981,7 +981,7 @@ test "parseGetCompatMap reads two interprets with syms 0x41 and 0xFE02" {
 }
 
 test "parseGetCompatMap rejects a reply shorter than the 32-byte header" {
-    const tiny = [_]u8{0} ** 31;
+    const tiny: [31]u8 = @splat(0);
     try std.testing.expectError(error.ShortReply, parseGetCompatMap(&tiny));
 }
 
@@ -1060,8 +1060,8 @@ test "keymapFromGetMap names kc8 from GetNames instead of the synthetic K8" {
     var map = try parseGetMap(std.testing.allocator, &bytes);
     defer map.deinit();
 
-    var name_bytes = [_]u8{0} ** 36;
-    std.mem.writeInt(u32, name_bytes[8..12], @intFromEnum(xkbproto.NameDetail.KeyNames), native_endian);
+    var name_bytes: [36]u8 = @splat(0);
+    std.mem.writeInt(u32, name_bytes[8..12], @backingInt(xkbproto.NameDetail.KeyNames), native_endian);
     name_bytes[18] = 8; // firstKey
     name_bytes[19] = 1; // nKeys
     @memcpy(name_bytes[32..36], "AC01");

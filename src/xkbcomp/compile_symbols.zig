@@ -58,7 +58,7 @@ fn resolveKeysym(expr: *const ast.Expr) Keysym {
             if (v < 0) return .no_symbol;
             var buf: [32]u8 = undefined;
             const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch return .no_symbol;
-            return keysym_lib.fromName(s, .{}) orelse @enumFromInt(@as(u32, @intCast(v)));
+            return keysym_lib.fromName(s, .{}) orelse @fromBackingInt(@intCast(@as(u32, @intCast(v))));
         },
         else => return .no_symbol,
     }

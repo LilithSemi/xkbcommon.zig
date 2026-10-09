@@ -58,7 +58,7 @@
           default = pkgs.mkShell {
             name = "xkbcommon-zig-dev-shell";
             packages = with pkgs; [
-              zig
+              zig_0_17
             ];
           };
         }
@@ -75,13 +75,13 @@
 
             src = lib.cleanSource ./.;
 
-            zigDeps = pkgs.zig.fetchDeps {
+            zigDeps = pkgs.zig_0_17.fetchDeps {
               inherit (finalAttrs) src pname version;
-              hash = "sha256-QngnBn2biqfoH/Em8ZQ58iwFB3LrZzvONExOK0dwPLU=";
+              hash = "sha256-tO5MFLqFTDQM3+v5EwW5J0lVBhC8ndxKQff/0YHFulY=";
             };
 
             nativeBuildInputs = with pkgs; [
-              zig
+              zig_0_17
             ];
 
             postConfigure = ''
