@@ -169,9 +169,19 @@ pub const Parser = struct {
                 base = p;
             } else if (self.tok.type == .dot) {
                 self.advance();
-                const field_tok = try self.expect(.ident);
+                // Field names share the identifier namespace with lexer
+                // keywords. Real xkeyboard-config data uses forms such as
+                // `key.type[Group1]`, where `type` is tokenized as kw_type.
+                const field = if (self.tok.type == .ident) blk: {
+                    const value = self.tok.text;
+                    self.advance();
+                    break :blk value;
+                } else if (self.keywordAsText()) |value| blk: {
+                    self.advance();
+                    break :blk value;
+                } else return self.fail("expected field name, got {s}", .{@tagName(self.tok.type)});
                 const p = try self.a().create(Expr);
-                p.* = .{ .dot = .{ .lhs = base, .field = field_tok.text } };
+                p.* = .{ .dot = .{ .lhs = base, .field = field } };
                 base = p;
             } else {
                 break;
@@ -449,7 +459,12 @@ pub const Parser = struct {
             .kw_include => {
                 self.advance();
                 const path_tok = try self.expect(.string);
-                _ = try self.expect(.semi);
+                // XKB include declarations conventionally omit the semicolon
+                // (the xkeyboard-config database does so throughout), though
+                // xkbcomp also accepts one. The following string token is a
+                // complete include declaration, so consume a semicolon only
+                // when it is present.
+                _ = self.accept(.semi);
                 return .{ .include = .{ .merge = merge, .path = path_tok.text } };
             },
             .keyname => {
@@ -1025,8 +1040,8 @@ test "parseFile: keymap wrapper with children" {
     try std.testing.expectEqual(ast.Component.Kind.symbols, km.children[1].kind);
 }
 
-test "parseDecl: include stmt path and default merge" {
-    const src = "xkb_symbols \"t\" { include \"us(basic)\"; };";
+test "parseDecl: include without semicolon and default merge" {
+    const src = "xkb_symbols \"t\" { include \"us(basic)\" };";
     var lexer = Lexer.init(std.testing.allocator, src);
     defer lexer.deinit();
     var p = Parser.init(std.testing.allocator, &lexer);
@@ -1036,6 +1051,18 @@ test "parseDecl: include stmt path and default merge" {
     const d = f.components[0].decls[0];
     try std.testing.expectEqualStrings("us(basic)", d.include.path);
     try std.testing.expectEqual(ast.MergeMode.default, d.include.merge);
+}
+
+test "parseDecl: keyword may be a dotted field name" {
+    const src = "xkb_symbols \"t\" { key.type[group1] = \"ALPHABETIC\"; };";
+    var lexer = Lexer.init(std.testing.allocator, src);
+    defer lexer.deinit();
+    var p = Parser.init(std.testing.allocator, &lexer);
+    defer p.deinit();
+    const f = try p.parseFile();
+    const lhs = f.components[0].decls[0].var_def.name.array_ref.base.dot;
+    try std.testing.expectEqualStrings("key", lhs.lhs.ident);
+    try std.testing.expectEqualStrings("type", lhs.field);
 }
 
 test "parseDecl: var_def key.repeat = true" {
